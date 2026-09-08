@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 memmap2 = { version = "0.9.11", optional = true }
 twox-hash = { version = "2.1.4", default-features = false, optional = true }
+zstd = { version = "0.14.0", default-features = false, optional = true }
 
 [features]
 default = ["read", "write", "fs"]
@@ -16,6 +17,7 @@ cli = []
 fs = []
 mount = ["read"]
 mmap = ["dep:memmap2", "fs", "read"]
+zstd = ["dep:zstd"]
 
 [[bin]]
 name = "stipple"

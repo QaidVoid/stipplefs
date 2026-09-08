@@ -578,12 +578,28 @@ impl<'i> Reader<'i> {
             if digest(&raw) != want {
                 return Err(Error::ChecksumMismatch { what: "block" });
             }
-            match e.codec {
-                Codec::Stored => Ok(raw),
-                Codec::Zstd | Codec::ZstdDict => Err(Error::UnsupportedCodec {
-                    missing: e.codec.bit(),
-                }),
+            let decoded = match e.codec {
+                Codec::Stored => raw,
+                #[cfg(feature = "zstd")]
+                Codec::Zstd => zstd::decode_all(&raw[..])?,
+                #[cfg(not(feature = "zstd"))]
+                Codec::Zstd => {
+                    return Err(Error::UnsupportedCodec {
+                        missing: e.codec.bit(),
+                    });
+                }
+                Codec::ZstdDict => {
+                    return Err(Error::UnsupportedCodec {
+                        missing: e.codec.bit(),
+                    });
+                }
+            };
+            if decoded.len() as u32 != e.decoded_length {
+                return Err(Error::Malformed {
+                    detail: "a block decoded to a length other than the one recorded",
+                });
             }
+            Ok(decoded)
         })?;
         Ok(Block::Cached(bytes))
     }
@@ -842,11 +858,11 @@ mod tests {
     #[test]
     fn rejects_a_codec_this_build_cannot_decode() {
         let mut b = fixture();
-        b[14..16].copy_from_slice(&(Codec::Stored.bit() | Codec::Zstd.bit()).to_le_bytes());
+        b[14..16].copy_from_slice(&(Codec::Stored.bit() | Codec::ZstdDict.bit()).to_le_bytes());
         seal(&mut b);
         let err = parse_superblock(&b, 4096 * 4).unwrap_err();
         assert!(
-            matches!(err, Error::UnsupportedCodec { missing } if missing == Codec::Zstd.bit()),
+            matches!(err, Error::UnsupportedCodec { missing } if missing == Codec::ZstdDict.bit()),
             "got {err:?}"
         );
     }
@@ -1018,6 +1034,7 @@ mod tests_support {
     /// plus the metadata sections describing it.
     pub struct Fs {
         pub stream: Vec<u8>,
+        pub codec: Codec,
         pub block_size: u32,
         pub inodes: Vec<Inode>,
         pub extents: Vec<Extent>,
@@ -1086,26 +1103,36 @@ mod tests_support {
                 data_at += padded(block_section_len);
             }
 
+            let stored: Vec<Vec<u8>> = blocks
+                .iter()
+                .map(|b| match self.codec {
+                    #[cfg(feature = "zstd")]
+                    Codec::Zstd => zstd::encode_all(&b[..], 3).unwrap(),
+                    _ => b.to_vec(),
+                })
+                .collect();
+
             let mut block_index = Vec::with_capacity(block_section_len);
             let mut at = data_at;
-            for b in &blocks {
+            for (raw, enc) in blocks.iter().zip(&stored) {
                 block_index.extend(block_entry(
                     at,
-                    b.len() as u32,
-                    b.len() as u32,
-                    Codec::Stored,
+                    enc.len() as u32,
+                    raw.len() as u32,
+                    self.codec,
                 ));
-                at += b.len() as u64 + 8;
+                at += enc.len() as u64 + 8;
             }
 
             let mut data = Vec::new();
-            for b in &blocks {
-                data.extend_from_slice(b);
-                data.extend_from_slice(&digest(b).to_le_bytes());
+            for enc in &stored {
+                data.extend_from_slice(enc);
+                data.extend_from_slice(&digest(enc).to_le_bytes());
             }
 
             let mut builder = Builder::default()
                 .block_count(blocks.len() as u32)
+                .codec_mask(Codec::Stored.bit() | self.codec.bit())
                 .with_data(data);
             builder.block_size = self.block_size;
             builder.stream_length = self.stream.len() as u64;
@@ -1258,9 +1285,12 @@ mod section_tests {
         let probe = Builder::default().section(SectionKind::Blocks, vec![0u8; 16]);
         let at = probe.data_offset();
         let image = Builder::default()
-            .section(SectionKind::Blocks, block_entry(at, 100, 4096, Codec::Zstd))
+            .section(
+                SectionKind::Blocks,
+                block_entry(at, 100, 4096, Codec::ZstdDict),
+            )
             .block_count(1)
-            .codec_mask(Codec::Stored.bit() | Codec::Zstd.bit())
+            .codec_mask(Codec::Stored.bit() | Codec::ZstdDict.bit())
             .with_data(vec![0xEE; 200])
             .build();
         // codec_mask names zstd, which this build cannot decode, so open fails first
@@ -1496,6 +1526,7 @@ mod read_tests {
     pub fn fs() -> Fs {
         Fs {
             stream: stream(),
+            codec: Codec::Stored,
             block_size: 4096,
             inodes: vec![
                 Inode {
@@ -1736,6 +1767,7 @@ mod read_tests {
         let n = 4096u32;
         let f = Fs {
             stream: stream(),
+            codec: Codec::Stored,
             block_size: 4096,
             inodes: vec![Inode {
                 size: n as u64,
@@ -1831,5 +1863,85 @@ mod cache_integration_tests {
         let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
         assert!(img.reader_with_budget(64).is_err());
         assert!(img.reader_with_budget(4096).is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "zstd"))]
+mod zstd_tests {
+    use super::read_tests::fs as base_fs;
+    use super::*;
+
+    #[test]
+    fn a_zstd_image_reads_identically_to_a_stored_one() {
+        let mut compressed = base_fs();
+        compressed.codec = Codec::Zstd;
+        let a = compressed.build();
+        let b = base_fs().build();
+
+        let total = |img: &[u8]| -> u32 {
+            let i = Image::new(img.to_vec(), 0, img.len() as u64).unwrap();
+            let idx = i.block_index().unwrap();
+            (0..idx.count())
+                .map(|k| idx.get(k).unwrap().stored_length)
+                .sum()
+        };
+        assert!(
+            total(&a) < total(&b),
+            "compression should shrink the stored bytes: {} vs {}",
+            total(&a),
+            total(&b)
+        );
+
+        let ia = Image::new(a.clone(), 0, a.len() as u64).unwrap();
+        let ib = Image::new(b.clone(), 0, b.len() as u64).unwrap();
+        let (ra, rb) = (ia.reader().unwrap(), ib.reader().unwrap());
+
+        for ino in [1u32, 2] {
+            let size = ra.inode(ino).unwrap().size as usize;
+            let mut want = vec![0u8; size];
+            let mut got = vec![0u8; size];
+            rb.read(ino, 0, &mut want).unwrap();
+            ra.read(ino, 0, &mut got).unwrap();
+            assert_eq!(got, want, "inode {ino} differs between codecs");
+        }
+    }
+
+    #[test]
+    fn a_compressed_block_is_cached_rather_than_lent() {
+        let mut compressed = base_fs();
+        compressed.codec = Codec::Zstd;
+        let image = compressed.build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let mut buf = vec![0u8; 100];
+        r.read(1, 0, &mut buf).unwrap();
+        assert!(
+            r.cache_used() > 0,
+            "a compressed block must be materialised into the cache"
+        );
+        assert!(r.cache_used() <= r.cache_budget());
+    }
+
+    #[test]
+    fn a_block_that_decodes_to_the_wrong_length_is_rejected() {
+        let mut compressed = base_fs();
+        compressed.codec = Codec::Zstd;
+        let mut image = compressed.build();
+
+        // Overstate the first block's decoded length in the block index.
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let blocks = img.superblock().section(SectionKind::Blocks);
+        let at = blocks.offset as usize + 12;
+        image[at..at + 3].copy_from_slice(&[0xff, 0x0f, 0x00]);
+        let end = (blocks.offset + blocks.size) as usize;
+        let d = digest(&image[blocks.offset as usize..end - 8]).to_le_bytes();
+        image[end - 8..end].copy_from_slice(&d);
+        let sb_d = digest(&image[..Superblock::CHECKSUM_OFFSET]).to_le_bytes();
+        image[Superblock::CHECKSUM_OFFSET..SUPERBLOCK_SIZE].copy_from_slice(&sb_d);
+
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let mut buf = vec![0u8; 100];
+        assert!(r.read(1, 0, &mut buf).is_err());
     }
 }

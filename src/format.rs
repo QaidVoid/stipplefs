@@ -81,8 +81,17 @@ impl Codec {
 }
 
 /// Codecs this build can decode.
+///
+/// A build selects its codecs, so a size-constrained reader can link only
+/// what it needs and refuse images it cannot serve.
 pub const fn supported_codecs() -> u16 {
-    Codec::Stored.bit()
+    #[allow(unused_mut)]
+    let mut mask = Codec::Stored.bit();
+    #[cfg(feature = "zstd")]
+    {
+        mask |= Codec::Zstd.bit();
+    }
+    mask
 }
 
 /// Where a section lives within the image.

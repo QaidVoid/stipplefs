@@ -341,33 +341,42 @@ fn every_writer_option_combination_round_trips() {
                     | stipplefs::format::Codec::ZstdDict.bit(),
             ] {
                 for threads in [1usize, 4] {
-                    let opts = Options {
-                        block_size,
-                        chunk_average,
-                        codecs,
-                        threads,
-                        memory_limit: None,
-                        level: 3,
-                        dictionary_size: 65536,
-                        timestamps: stipplefs::write::Timestamps::Clamp,
-                    };
-                    let (image, expected) = random_tree(9, opts);
-                    let reference = Reference::open(image.clone());
-                    let mut found = BTreeMap::new();
-                    walk(&reference, 0, Vec::new(), &mut found);
-                    for (path, ino) in &found {
-                        assert_eq!(
-                            &reference.read_file(*ino),
-                            &expected[path],
-                            "block {block_size} chunk {chunk_average} codecs {codecs:#x} threads {threads}"
-                        );
+                    for timestamps in [
+                        stipplefs::write::Timestamps::Clamp,
+                        stipplefs::write::Timestamps::Preserve,
+                    ] {
+                        for memory_limit in [None, Some(1 << 20), Some(64 << 20)] {
+                            let opts = Options {
+                                block_size,
+                                chunk_average,
+                                codecs,
+                                threads,
+                                memory_limit,
+                                level: 3,
+                                dictionary_size: 65536,
+                                timestamps,
+                            };
+                            let (image, expected) = random_tree(9, opts);
+                            let reference = Reference::open(image.clone());
+                            let mut found = BTreeMap::new();
+                            walk(&reference, 0, Vec::new(), &mut found);
+                            for (path, ino) in &found {
+                                assert_eq!(
+                                    &reference.read_file(*ino),
+                                    &expected[path],
+                                    "block {block_size} chunk {chunk_average} codecs {codecs:#x} \
+                                     threads {threads} timestamps {timestamps:?} \
+                                     memory {memory_limit:?}"
+                                );
+                            }
+                            checked += 1;
+                        }
                     }
-                    checked += 1;
                 }
             }
         }
     }
-    assert_eq!(checked, 24);
+    assert_eq!(checked, 144);
 }
 
 /// A deliberately naive writer: no deduplication, no compression, one extent

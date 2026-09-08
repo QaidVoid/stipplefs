@@ -4,15 +4,28 @@
 //! than each performing their own, and different blocks decode in parallel.
 
 use crate::error::{Error, Result};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
+
+struct Slot {
+    bytes: Arc<[u8]>,
+    /// Tick at which this block was last wanted.
+    used_at: u64,
+}
 
 #[derive(Default)]
 struct Inner {
-    ready: HashMap<u32, Arc<[u8]>>,
-    recent: VecDeque<u32>,
+    ready: HashMap<u32, Slot>,
     decoding: Vec<u32>,
     used: usize,
+    clock: u64,
+}
+
+impl Inner {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
 }
 
 /// A cache of decoded blocks whose memory stays within a budget.
@@ -82,10 +95,11 @@ impl BlockCache {
     {
         let mut inner = self.lock();
         loop {
-            if let Some(bytes) = inner.ready.get(&index) {
-                let bytes = Arc::clone(bytes);
-                touch(&mut inner, index);
-                return Ok(bytes);
+            if inner.ready.contains_key(&index) {
+                let now = inner.tick();
+                let slot = inner.ready.get_mut(&index).expect("just checked");
+                slot.used_at = now;
+                return Ok(Arc::clone(&slot.bytes));
             }
             if inner.decoding.contains(&index) {
                 inner = match self.changed.wait(inner) {
@@ -112,9 +126,13 @@ impl BlockCache {
         flight.done = true;
         if bytes.len() <= self.budget {
             evict_for(&mut inner, bytes.len(), self.budget);
-            if inner.ready.insert(index, Arc::clone(&bytes)).is_none() {
+            let now = inner.tick();
+            let slot = Slot {
+                bytes: Arc::clone(&bytes),
+                used_at: now,
+            };
+            if inner.ready.insert(index, slot).is_none() {
                 inner.used += bytes.len();
-                inner.recent.push_back(index);
             }
         }
         drop(inner);
@@ -123,20 +141,24 @@ impl BlockCache {
     }
 }
 
-fn touch(inner: &mut Inner, index: u32) {
-    if let Some(at) = inner.recent.iter().position(|&i| i == index) {
-        inner.recent.remove(at);
-    }
-    inner.recent.push_back(index);
-}
-
+/// Drop least recently wanted blocks until `incoming` more bytes fit.
+///
+/// Finding the oldest entry is linear in the number of cached blocks, but it
+/// only runs when an insert would exceed the budget, and every such insert has
+/// just paid for a decode. Promotion on a hit, which is the hot path, is
+/// constant time.
 fn evict_for(inner: &mut Inner, incoming: usize, budget: usize) {
     while inner.used + incoming > budget {
-        let Some(oldest) = inner.recent.pop_front() else {
+        let Some(oldest) = inner
+            .ready
+            .iter()
+            .min_by_key(|(_, slot)| slot.used_at)
+            .map(|(index, _)| *index)
+        else {
             return;
         };
-        if let Some(bytes) = inner.ready.remove(&oldest) {
-            inner.used -= bytes.len();
+        if let Some(slot) = inner.ready.remove(&oldest) {
+            inner.used -= slot.bytes.len();
         }
     }
 }

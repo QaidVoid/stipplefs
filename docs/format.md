@@ -40,7 +40,7 @@ Occupies exactly 4096 bytes at image offset 0.
 |---|---|---|---|
 | 0 | 8 | `magic` | ASCII `STIPPLE\0`, bytes `53 54 49 50 50 4C 45 00` |
 | 8 | 2 | `version_major` | `1` for this document |
-| 10 | 2 | `version_minor` | `0` for this document |
+| 10 | 2 | `version_minor` | `1` for this document |
 | 12 | 2 | `flags` | reserved, zero in version 1.0 |
 | 14 | 2 | `codec_mask` | bitmask of every codec used anywhere in the image |
 | 16 | 8 | `image_length` | total size of the image in bytes |
@@ -51,13 +51,13 @@ Occupies exactly 4096 bytes at image offset 0.
 | 44 | 4 | `block_count` | number of entries in the block index |
 | 48 | 4 | `root_inode` | inode number of the root directory |
 | 52 | 4 | reserved | zero |
-| 56 | 8x2 x 6 | `sections` | six `(offset, length)` pairs, see below |
-| 152 | 3936 | reserved | zero |
+| 56 | 8x2 x 8 | `sections` | eight `(offset, length)` pairs, see below |
+| 184 | 3904 | reserved | zero |
 | 4088 | 8 | `checksum` | `xxh3-64` over bytes `[0, 4088)` |
 
 ### Section table
 
-Six `(offset [8], length [8])` pairs, in this fixed order:
+Eight `(offset [8], length [8])` pairs, in this fixed order:
 
 | Index | Section |
 |---|---|
@@ -67,13 +67,18 @@ Six `(offset [8], length [8])` pairs, in this fixed order:
 | 3 | extent table |
 | 4 | block index |
 | 5 | dictionaries |
+| 6 | attribute table |
+| 7 | extended attributes |
 
 A section with `length == 0` is absent and its `offset` SHALL be zero.
 
 A reader SHALL reject the image unless all of the following hold:
 
 1. `magic` matches.
-2. `version_major == 1`. A greater `version_minor` is accepted.
+2. `version_major == 1`, and `version_minor` is at least the lowest the reader
+   implements. A greater `version_minor` is accepted. The inode table's layout
+   changed at minor version 1, and no reader can interpret both, so a reader
+   implementing this document rejects minor version 0.
 3. `checksum` matches the computed digest.
 4. `image_length` is a multiple of 4096 and does not exceed the range the
    caller supplied.
@@ -146,36 +151,106 @@ Resolving a file offset is a binary search over that run on `file_offset`.
 
 ## Inode table
 
-`inode_count` entries of 40 bytes each, indexed by inode number starting at 0.
+Inodes are stored as parallel arrays rather than as records, one array per
+field, each entry a little-endian unsigned integer of a width the image
+chooses. A tree's largest file, its longest stream and its number of distinct
+attribute tuples all vary by orders of magnitude between images, and a fixed
+record has to be wide enough for the worst of them on every inode.
+
+The section begins with a sixteen byte header:
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 8 | `size` for a file, entry count for a directory, target length for a link |
-| 8 | 8 | `payload`, see below |
-| 16 | 4 | `extent_count`, zero for non-files |
-| 20 | 4 | `mode`, POSIX type and permission bits |
-| 24 | 4 | `uid` |
-| 28 | 4 | `gid` |
-| 32 | 4 | `nlink` |
-| 36 | 4 | reserved |
+| 0 | 1 | `width_size`, 1 to 8 |
+| 1 | 1 | `width_payload`, 1 to 8 |
+| 2 | 1 | `width_attrs`, 1 to 4 |
+| 3 | 1 | `width_nlink`, 1 to 4 |
+| 4 | 1 | `width_mtime`, 0 to 8, zero when no time is recorded |
+| 5 | 1 | `width_xattr`, 0 to 4, zero when no inode has attributes |
+| 6 | 1 | `width_extents`, 1 to 4 |
+| 7 | 1 | reserved |
+| 8 | 8 | `mtime_base`, seconds the recorded offsets are measured from |
 
-`payload` is interpreted by file type:
+The arrays follow the header back to back, each holding `inode_count` entries,
+in this order: `size`, `payload`, `attrs`, `nlink`, `mtime`, `xattr`,
+`extents`. An array whose width is zero is absent entirely and occupies no
+space. Inode `i`'s value in an array beginning at `base` with width `w` is the
+`w` bytes at `base + i * w`, read little-endian, so lookup remains a single
+indexed read.
 
-- **Regular file**, `extent_count == 1`: `payload` is the `stream_offset` of
-  the file's single extent, and the extent table is not consulted.
-- **Regular file**, `extent_count > 1`: `payload` is the index of the file's
-  first entry in the extent table.
-- **Directory**: `payload` is the index of its first entry in the directory
-  entry table.
-- **Symbolic link**: `payload` is a byte offset into the name table where the
-  target begins.
+A reader SHALL reject the section unless every width lies in the range its row
+gives, and unless the arrays together with the header exactly fill the section
+apart from its trailing digest.
 
-A regular file with `extent_count == 0` SHALL have `size == 0`.
+### What each array holds
 
-> The single-extent case is inlined because measurement across three corpora
-> found 83% to 99.6% of files have exactly one extent. Its length is already
-> `size` and its `file_offset` is necessarily zero, so only the stream offset
-> is needed.
+- **`size`**: file size in bytes for a regular file, entry count for a
+  directory, target length in bytes for a symbolic link, and zero otherwise.
+- **`payload`**: for a regular file with one extent, the stream offset of that
+  extent; with more than one, the index of its first entry in the extent table.
+  For a directory, the index of its first entry in the directory entry table.
+  For a symbolic link, the byte offset of its target in the name table. For a
+  character or block device, the device number, with the major number in the
+  upper thirty-two bits and the minor in the lower. Zero otherwise.
+- **`attrs`**: an index into the attribute table, which carries the mode and so
+  determines the entry's kind.
+- **`nlink`**: the number of names referring to this inode, at least one.
+- **`mtime`**: seconds after `mtime_base`. Absent when `width_mtime` is zero,
+  in which case a reader reports no time.
+- **`xattr`**: zero when the inode has no extended attributes, otherwise one
+  more than an index into the extended attribute table. Absent when
+  `width_xattr` is zero.
+- **`extents`**: the number of extents, zero for anything that is not a regular
+  file and for an empty one.
+
+## Attribute table
+
+Entries of 12 bytes, holding the values that repeat across a tree.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `mode`, POSIX type and permission bits |
+| 4 | 4 | `uid` |
+| 8 | 4 | `gid` |
+
+Entries SHALL be sorted ascending by `mode`, then `uid`, then `gid`, and SHALL
+be distinct. Sorting makes the order a function of the content rather than of
+the order the writer happened to encounter values.
+
+An inode's kind comes from the type bits of its entry's `mode`. The format
+defines seven: regular file, directory, symbolic link, named pipe, socket,
+character device and block device. A reader SHALL reject an inode whose mode
+names none of them, and SHALL reject an `attrs` index at or beyond the number
+of entries.
+
+## Extended attributes
+
+Absent unless some inode has attributes. The section holds, in order:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `set_count`, the number of distinct attribute sets |
+| 4 | 4 | `pair_count`, the number of name and value pairs across all sets |
+| 8 | 4 x (`set_count` + 1) | `set_starts`, where each set's pairs begin, ascending, the last being `pair_count` |
+| ... | 12 x `pair_count` | pairs, see below |
+| ... | rest | the byte pool names and values point into |
+
+Each pair is 12 bytes:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `name_offset` into the pool |
+| 4 | 2 | `name_length` |
+| 6 | 4 | `value_offset` into the pool |
+| 10 | 2 | `value_length` |
+
+Set `k` owns the pairs from `set_starts[k]` up to `set_starts[k + 1]`. A name
+that repeats across sets SHALL occupy the pool once, so a tree where every file
+carries the same attribute name pays for that name a single time. Pairs within
+a set SHALL be sorted ascending by name bytes.
+
+A reader SHALL reject the section unless `set_starts` increases, ends at
+`pair_count`, and every offset and length lies inside the pool.
 
 ## Directory entries and names
 
@@ -241,6 +316,15 @@ output from identical input.
 9. A block is stored with codec `stored` when no available codec produces a
    strictly smaller result. Among codecs producing the same size, the lowest
    codec id wins.
+10. Attribute table entries are sorted ascending by mode, then user, then
+    group.
+11. Each inode array's width is the smallest that represents every value it
+    must hold, so the widths are a function of the content.
+12. Extended attribute sets appear in order of first reference by rule 2, pairs
+    within a set are sorted by name bytes, and a repeated name or value
+    occupies the pool once.
+13. `mtime_base` is the smallest modification time the image records, or zero
+    when it records none.
 
 Rule 9 exists because a size tie between codecs would otherwise leave the
 choice to the writer's iteration order, which is not determined by content.

@@ -2,9 +2,10 @@
 
 use crate::error::{Error, Result};
 use crate::format::{
-    ALIGNMENT, BLOCK_ENTRY_SIZE, Codec, DIRENT_SIZE, Dirent, EXTENT_SIZE, Extent, FileType,
-    INODE_SIZE, Inode, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, SECTION_COUNT, SUPERBLOCK_SIZE,
-    Section, SectionKind, Superblock, VERSION_MAJOR, supported_codecs,
+    ALIGNMENT, ATTR_ENTRY_SIZE, BLOCK_ENTRY_SIZE, Codec, DIRENT_SIZE, Dirent, EXTENT_SIZE, Extent,
+    FileType, INODE_HEADER_SIZE, Inode, InodeWidths, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE,
+    MIN_VERSION_MINOR, SECTION_COUNT, SUPERBLOCK_SIZE, Section, SectionKind, Superblock,
+    VERSION_MAJOR, XATTR_PAIR_SIZE, supported_codecs,
 };
 use crate::source::{ByteSource, Region};
 
@@ -49,6 +50,13 @@ pub(crate) fn parse_superblock(
         return Err(Error::UnsupportedVersion {
             major: version_major,
             supported: VERSION_MAJOR,
+        });
+    }
+    let version_minor = u16at(bytes, 10);
+    if version_minor < MIN_VERSION_MINOR {
+        return Err(Error::UnsupportedMinorVersion {
+            minor: version_minor,
+            supported: MIN_VERSION_MINOR,
         });
     }
 
@@ -134,7 +142,7 @@ pub(crate) fn parse_superblock(
 
     Ok(Superblock {
         version_major,
-        version_minor: u16at(bytes, 10),
+        version_minor,
         flags: u16at(bytes, 12),
         codec_mask,
         image_length,
@@ -189,6 +197,44 @@ impl Image<'static> {
         let file = std::fs::File::open(path)?;
         Image::new(crate::source::FileSource::new(file)?, offset, size)
     }
+}
+
+/// Read the widths that open the inode table, and check the arrays fit.
+fn parse_inode_widths(section: &[u8], inode_count: u32) -> Result<InodeWidths> {
+    if inode_count == 0 {
+        return Ok(InodeWidths::default());
+    }
+    let head = section.get(..INODE_HEADER_SIZE).ok_or(Error::Malformed {
+        detail: "the inode table is too short to hold its header",
+    })?;
+    let widths = InodeWidths {
+        size: head[0],
+        payload: head[1],
+        attrs: head[2],
+        nlink: head[3],
+        mtime: head[4],
+        xattr: head[5],
+        extents: head[6],
+        mtime_base: le_u64(&head[8..16]),
+    };
+    if !widths.is_valid() {
+        return Err(Error::Malformed {
+            detail: "an inode array width lies outside the permitted range",
+        });
+    }
+    let needed = widths
+        .per_inode()
+        .checked_mul(inode_count as usize)
+        .and_then(|n| n.checked_add(INODE_HEADER_SIZE))
+        .ok_or(Error::Malformed {
+            detail: "the inode arrays overflow",
+        })?;
+    if section.len() < needed {
+        return Err(Error::Malformed {
+            detail: "the inode table is shorter than its widths require",
+        });
+    }
+    Ok(widths)
 }
 
 /// A metadata section's bytes, borrowed when the source allows it.
@@ -377,6 +423,9 @@ pub struct Reader<'i> {
     extents: SectionData<'i>,
     dirents: SectionData<'i>,
     names: SectionData<'i>,
+    attrs: SectionData<'i>,
+    xattrs: SectionData<'i>,
+    widths: InodeWidths,
     blocks: BlockIndex<'i>,
     cache: crate::cache::BlockCache,
     metrics: crate::metrics::Metrics,
@@ -422,17 +471,54 @@ impl<'i> Reader<'i> {
         if ino >= self.superblock.inode_count {
             return None;
         }
-        let at = ino as usize * INODE_SIZE;
-        let e = self.inodes.get(at..at + INODE_SIZE)?;
+        let w = &self.widths;
+        let i = ino as usize;
+        let n = self.superblock.inode_count as usize;
+        let body = self.inodes.get(INODE_HEADER_SIZE..)?;
+
+        // Each array is contiguous, so a field is one indexed read.
+        let mut at = 0usize;
+        let mut take = |width: u8| -> Option<u64> {
+            if width == 0 {
+                return None;
+            }
+            let base = at + i * width as usize;
+            let bytes = body.get(base..base + width as usize)?;
+            at += n * width as usize;
+            let mut v = [0u8; 8];
+            v[..bytes.len()].copy_from_slice(bytes);
+            Some(u64::from_le_bytes(v))
+        };
+
+        let size = take(w.size)?;
+        let payload = take(w.payload)?;
+        let attrs = take(w.attrs)? as u32;
+        let nlink = take(w.nlink)? as u32;
+        let mtime = take(w.mtime).map(|t| w.mtime_base + t);
+        let xattr = take(w.xattr)
+            .and_then(|v| v.checked_sub(1))
+            .map(|v| v as u32);
+        let extent_count = take(w.extents)? as u32;
+
+        let (mode, uid, gid) = self.attribute(attrs)?;
         Some(Inode {
-            size: le_u64(&e[0..8]),
-            payload: le_u64(&e[8..16]),
-            extent_count: le_u32(&e[16..20]),
-            mode: le_u32(&e[20..24]),
-            uid: le_u32(&e[24..28]),
-            gid: le_u32(&e[28..32]),
-            nlink: le_u32(&e[32..36]),
+            size,
+            payload,
+            extent_count,
+            mode,
+            uid,
+            gid,
+            nlink,
+            mtime,
+            xattr,
         })
+    }
+
+    /// The mode, owner and group an attribute table entry holds.
+    fn attribute(&self, index: u32) -> Option<(u32, u32, u32)> {
+        let at = index as usize * ATTR_ENTRY_SIZE;
+        let e = self.attrs.get(at..at + ATTR_ENTRY_SIZE)?;
+        Some((le_u32(&e[0..4]), le_u32(&e[4..8]), le_u32(&e[8..12])))
     }
 
     /// Extent table entry `i`.
@@ -466,6 +552,64 @@ impl<'i> Reader<'i> {
     pub fn name(&self, entry: Dirent) -> Option<&[u8]> {
         let at = entry.name_offset as usize;
         self.names.get(at..at + entry.name_length as usize)
+    }
+
+    /// The extended attributes recorded for an inode, as name and value pairs.
+    ///
+    /// An inode with none yields an empty vector rather than an error.
+    pub fn xattrs(&self, ino: u32) -> Result<Vec<(&[u8], &[u8])>> {
+        let Some(set) = self.inode(ino).and_then(|n| n.xattr) else {
+            return Ok(Vec::new());
+        };
+        let s = &self.xattrs;
+        let malformed = |detail| Error::Malformed { detail };
+
+        let head = s
+            .get(..8)
+            .ok_or(malformed("the extended attribute section is too short"))?;
+        let set_count = le_u32(&head[0..4]) as usize;
+        let pair_count = le_u32(&head[4..8]) as usize;
+        if set as usize >= set_count {
+            return Err(malformed(
+                "an inode names an attribute set that does not exist",
+            ));
+        }
+
+        let starts_at = 8;
+        let pairs_at = starts_at + 4 * (set_count + 1);
+        let pool_at = pairs_at + XATTR_PAIR_SIZE * pair_count;
+        let starts = s
+            .get(starts_at..pairs_at)
+            .ok_or(malformed("the attribute set index is truncated"))?;
+        let pool = s
+            .get(pool_at..)
+            .ok_or(malformed("the attribute pool is truncated"))?;
+
+        let first = le_u32(&starts[set as usize * 4..]) as usize;
+        let last = le_u32(&starts[(set as usize + 1) * 4..]) as usize;
+        if first > last || last > pair_count {
+            return Err(malformed("an attribute set spans an impossible range"));
+        }
+
+        let mut out = Vec::with_capacity(last - first);
+        for i in first..last {
+            let at = pairs_at + i * XATTR_PAIR_SIZE;
+            let e = s
+                .get(at..at + XATTR_PAIR_SIZE)
+                .ok_or(malformed("an attribute pair is truncated"))?;
+            let name_off = le_u32(&e[0..4]) as usize;
+            let name_len = le_u16(&e[4..6]) as usize;
+            let value_off = le_u32(&e[6..10]) as usize;
+            let value_len = le_u16(&e[10..12]) as usize;
+            let name = pool
+                .get(name_off..name_off + name_len)
+                .ok_or(malformed("an attribute name lies outside the pool"))?;
+            let value = pool
+                .get(value_off..value_off + value_len)
+                .ok_or(malformed("an attribute value lies outside the pool"))?;
+            out.push((name, value));
+        }
+        Ok(out)
     }
 
     /// The bytes a symbolic link points at.
@@ -866,10 +1010,15 @@ impl<'a> Image<'a> {
     /// digests.
     pub fn reader_with_budget(&self, budget: usize) -> Result<Reader<'_>> {
         crate::cache::check_budget(budget, self.superblock.block_size as usize)?;
+        let inodes = self.section_data(SectionKind::Inodes)?;
+        let widths = parse_inode_widths(&inodes, self.superblock.inode_count)?;
         Ok(Reader {
             superblock: self.superblock,
             region: &self.region,
-            inodes: self.section_data(SectionKind::Inodes)?,
+            attrs: self.section_data(SectionKind::Attributes)?,
+            xattrs: self.section_data(SectionKind::ExtendedAttributes)?,
+            widths,
+            inodes,
             extents: self.section_data(SectionKind::Extents)?,
             dirents: self.section_data(SectionKind::Dirents)?,
             names: self.section_data(SectionKind::Names)?,
@@ -898,14 +1047,15 @@ impl<'a> Image<'a> {
 mod tests {
     use super::*;
     use crate::format::SectionKind;
+    use crate::format::VERSION_MINOR;
 
     /// Builds a superblock byte by byte at the offsets `docs/format.md` gives,
     /// so the fixture exercises the specification rather than the writer.
     fn fixture() -> [u8; SUPERBLOCK_SIZE] {
         let mut b = [0u8; SUPERBLOCK_SIZE];
         b[0..8].copy_from_slice(&MAGIC);
-        b[8..10].copy_from_slice(&1u16.to_le_bytes());
-        b[10..12].copy_from_slice(&0u16.to_le_bytes());
+        b[8..10].copy_from_slice(&VERSION_MAJOR.to_le_bytes());
+        b[10..12].copy_from_slice(&VERSION_MINOR.to_le_bytes());
         b[12..14].copy_from_slice(&0u16.to_le_bytes());
         b[14..16].copy_from_slice(&1u16.to_le_bytes());
         b[16..24].copy_from_slice(&(4096u64 * 4).to_le_bytes());
@@ -934,7 +1084,7 @@ mod tests {
     fn fixture_parses_field_by_field() {
         let sb = parse_superblock(&fixture(), 4096 * 4).unwrap();
         assert_eq!(sb.version_major, 1);
-        assert_eq!(sb.version_minor, 0);
+        assert_eq!(sb.version_minor, VERSION_MINOR);
         assert_eq!(sb.flags, 0);
         assert_eq!(sb.codec_mask, Codec::Stored.bit());
         assert_eq!(sb.image_length, 4096 * 4);
@@ -996,9 +1146,12 @@ mod tests {
     #[test]
     fn accepts_a_newer_minor_version() {
         let mut b = fixture();
-        b[10..12].copy_from_slice(&7u16.to_le_bytes());
+        b[10..12].copy_from_slice(&(VERSION_MINOR + 7).to_le_bytes());
         seal(&mut b);
-        assert_eq!(parse_superblock(&b, 4096 * 4).unwrap().version_minor, 7);
+        assert_eq!(
+            parse_superblock(&b, 4096 * 4).unwrap().version_minor,
+            VERSION_MINOR + 7
+        );
     }
 
     #[test]
@@ -1144,6 +1297,7 @@ mod image_tests {
 #[cfg(test)]
 mod tests_support {
     use super::*;
+    use crate::format::VERSION_MINOR;
 
     /// Lays out a whole image: superblock, 4096-aligned sections each with a
     /// trailing digest, then a data area.
@@ -1225,7 +1379,8 @@ mod tests_support {
 
             let mut b = [0u8; SUPERBLOCK_SIZE];
             b[0..8].copy_from_slice(&MAGIC);
-            b[8..10].copy_from_slice(&1u16.to_le_bytes());
+            b[8..10].copy_from_slice(&VERSION_MAJOR.to_le_bytes());
+            b[10..12].copy_from_slice(&VERSION_MINOR.to_le_bytes());
             b[14..16].copy_from_slice(&self.codec_mask.to_le_bytes());
             b[16..24].copy_from_slice(&total.to_le_bytes());
             b[24..32].copy_from_slice(&self.stream_length.to_le_bytes());
@@ -1260,17 +1415,66 @@ mod tests_support {
         pub names: Vec<u8>,
     }
 
-    fn enc_inode(i: &Inode) -> Vec<u8> {
-        let mut v = Vec::with_capacity(INODE_SIZE);
-        v.extend_from_slice(&i.size.to_le_bytes());
-        v.extend_from_slice(&i.payload.to_le_bytes());
-        v.extend_from_slice(&i.extent_count.to_le_bytes());
-        v.extend_from_slice(&i.mode.to_le_bytes());
-        v.extend_from_slice(&i.uid.to_le_bytes());
-        v.extend_from_slice(&i.gid.to_le_bytes());
-        v.extend_from_slice(&i.nlink.to_le_bytes());
-        v.extend_from_slice(&0u32.to_le_bytes());
-        v
+    /// Encode inodes the way `docs/format.md` describes: a header of widths,
+    /// then one array per field. Written independently of the writer so the
+    /// fixtures exercise the specification rather than the implementation.
+    fn enc_inodes(records: &[Inode]) -> (Vec<u8>, Vec<u8>) {
+        if records.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let mut tuples: Vec<(u32, u32, u32)> =
+            records.iter().map(|r| (r.mode, r.uid, r.gid)).collect();
+        tuples.sort_unstable();
+        tuples.dedup();
+
+        let mut attrs = Vec::new();
+        for (mode, uid, gid) in &tuples {
+            attrs.extend_from_slice(&mode.to_le_bytes());
+            attrs.extend_from_slice(&uid.to_le_bytes());
+            attrs.extend_from_slice(&gid.to_le_bytes());
+        }
+
+        let w = |vals: &[u64]| -> u8 {
+            let max = vals.iter().copied().max().unwrap_or(0);
+            ((64 - max.leading_zeros()).div_ceil(8)).max(1) as u8
+        };
+        let sizes: Vec<u64> = records.iter().map(|r| r.size).collect();
+        let payloads: Vec<u64> = records.iter().map(|r| r.payload).collect();
+        let nlinks: Vec<u64> = records.iter().map(|r| r.nlink as u64).collect();
+        let extents: Vec<u64> = records.iter().map(|r| r.extent_count as u64).collect();
+        let widths = (
+            w(&sizes),
+            w(&payloads),
+            w(&[tuples.len().saturating_sub(1) as u64]),
+            w(&nlinks),
+            w(&extents),
+        );
+
+        let mut out = vec![widths.0, widths.1, widths.2, widths.3, 0, 0, widths.4, 0];
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let push = |v: u64, width: u8, out: &mut Vec<u8>| {
+            out.extend_from_slice(&v.to_le_bytes()[..width as usize]);
+        };
+        for v in &sizes {
+            push(*v, widths.0, &mut out);
+        }
+        for v in &payloads {
+            push(*v, widths.1, &mut out);
+        }
+        for r in records {
+            let at = tuples
+                .iter()
+                .position(|t| *t == (r.mode, r.uid, r.gid))
+                .expect("tuple present");
+            push(at as u64, widths.2, &mut out);
+        }
+        for v in &nlinks {
+            push(*v, widths.3, &mut out);
+        }
+        for v in &extents {
+            push(*v, widths.4, &mut out);
+        }
+        (out, attrs)
     }
 
     fn enc_extent(e: &Extent) -> Vec<u8> {
@@ -1296,7 +1500,7 @@ mod tests_support {
             let bs = self.block_size as usize;
             let blocks: Vec<&[u8]> = self.stream.chunks(bs).collect();
 
-            let inodes: Vec<u8> = self.inodes.iter().flat_map(enc_inode).collect();
+            let (inodes, attributes) = enc_inodes(&self.inodes);
             let dirents: Vec<u8> = self.dirents.iter().flat_map(enc_dirent).collect();
             let extents: Vec<u8> = self.extents.iter().flat_map(enc_extent).collect();
             let block_section_len = blocks.len() * BLOCK_ENTRY_SIZE;
@@ -1307,6 +1511,7 @@ mod tests_support {
                 (SectionKind::Dirents, dirents),
                 (SectionKind::Names, self.names.clone()),
                 (SectionKind::Extents, extents),
+                (SectionKind::Attributes, attributes),
             ]
             .into_iter()
             .chain(
@@ -1391,7 +1596,8 @@ mod tests_support {
     pub fn valid_image() -> Vec<u8> {
         let mut b = [0u8; SUPERBLOCK_SIZE];
         b[0..8].copy_from_slice(&MAGIC);
-        b[8..10].copy_from_slice(&1u16.to_le_bytes());
+        b[8..10].copy_from_slice(&VERSION_MAJOR.to_le_bytes());
+        b[10..12].copy_from_slice(&VERSION_MINOR.to_le_bytes());
         b[14..16].copy_from_slice(&Codec::Stored.bit().to_le_bytes());
         b[16..24].copy_from_slice(&(4096u64 * 4).to_le_bytes());
         b[24..32].copy_from_slice(&1234u64.to_le_bytes());
@@ -1769,6 +1975,8 @@ mod read_tests {
                     uid: 0,
                     gid: 0,
                     nlink: 2,
+                    mtime: None,
+                    xattr: None,
                 },
                 Inode {
                     size: 100,
@@ -1778,6 +1986,8 @@ mod read_tests {
                     uid: 1000,
                     gid: 1000,
                     nlink: 1,
+                    mtime: None,
+                    xattr: None,
                 },
                 Inode {
                     size: 250,
@@ -1787,6 +1997,8 @@ mod read_tests {
                     uid: 1000,
                     gid: 1000,
                     nlink: 1,
+                    mtime: None,
+                    xattr: None,
                 },
                 Inode {
                     size: 11,
@@ -1796,6 +2008,8 @@ mod read_tests {
                     uid: 0,
                     gid: 0,
                     nlink: 1,
+                    mtime: None,
+                    xattr: None,
                 },
             ],
             extents: vec![
@@ -2010,6 +2224,8 @@ mod read_tests {
                 uid: 0,
                 gid: 0,
                 nlink: 1,
+                mtime: None,
+                xattr: None,
             }],
             extents: (0..n)
                 .map(|i| Extent {
@@ -2331,5 +2547,45 @@ mod integrity_tests {
             Image::new(bad.clone(), 0, bad.len() as u64),
             Err(Error::ChecksumMismatch { what: "superblock" })
         ));
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::tests_support::Builder;
+    use super::*;
+
+    #[test]
+    fn an_image_predating_the_inode_layout_is_refused() {
+        let image = Builder::default().build();
+        let mut old = image.clone();
+        old[10..12].copy_from_slice(&0u16.to_le_bytes());
+        let d = digest(&old[..Superblock::CHECKSUM_OFFSET]).to_le_bytes();
+        old[Superblock::CHECKSUM_OFFSET..SUPERBLOCK_SIZE].copy_from_slice(&d);
+
+        let err = match Image::new(old.clone(), 0, old.len() as u64) {
+            Err(e) => e,
+            Ok(_) => panic!("an image predating the layout change was accepted"),
+        };
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedMinorVersion {
+                    minor: 0,
+                    supported: MIN_VERSION_MINOR
+                }
+            ),
+            "expected a minor version refusal, got {err:?}"
+        );
+        // The message must name both versions so the cause is obvious.
+        let text = err.to_string();
+        assert!(
+            text.contains("1.0"),
+            "message should name the image's version: {text}"
+        );
+        assert!(
+            text.contains(&format!("1.{MIN_VERSION_MINOR}")),
+            "message should name ours: {text}"
+        );
     }
 }

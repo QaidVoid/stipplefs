@@ -111,7 +111,7 @@ fn build_check_and_extract_reproduce_the_tree() {
     );
     let report = String::from_utf8_lossy(&checked.stdout);
     assert!(
-        report.contains("format          1.0"),
+        report.contains("format          1."),
         "report was: {report}"
     );
     assert!(report.contains("verified"), "report was: {report}");
@@ -336,13 +336,17 @@ fn hard_links_survive_a_round_trip() {
 }
 
 #[test]
-fn source_timestamps_do_not_affect_the_image() {
+fn source_timestamps_do_not_affect_the_image_when_clamped() {
     let s = Scratch::new("timestamps");
     let src = s.path("src");
     make_tree(&src);
 
     let first = s.path("first.stipple");
-    assert!(build_image(&src, &first, &[]).status.success());
+    assert!(
+        build_image(&src, &first, &["--mtime", "zero"])
+            .status
+            .success()
+    );
 
     // Move every timestamp well into the past. The format records none of
     // them, so the bytes must not move either.
@@ -358,11 +362,122 @@ fn source_timestamps_do_not_affect_the_image() {
     );
 
     let second = s.path("second.stipple");
-    assert!(build_image(&src, &second, &[]).status.success());
+    assert!(
+        build_image(&src, &second, &["--mtime", "zero"])
+            .status
+            .success()
+    );
 
     assert_eq!(
         std::fs::read(&first).unwrap(),
         std::fs::read(&second).unwrap(),
         "changing source timestamps changed the image"
     );
+}
+
+#[test]
+fn modification_times_survive_under_the_preserving_policy() {
+    let s = Scratch::new("mtime-preserve");
+    let src = s.path("src");
+    make_tree(&src);
+
+    // A time far enough in the past that it cannot be confused with now.
+    let out = Command::new("find")
+        .arg(&src)
+        .args(["-exec", "touch", "-d", "2003-04-05 06:07:08", "{}", "+"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let img = s.path("out.stipple");
+    assert!(
+        build_image(&src, &img, &["--mtime", "preserve"])
+            .status
+            .success()
+    );
+    let dest = s.path("out");
+    assert!(
+        Command::new(ST)
+            .args(["extract"])
+            .arg(&img)
+            .arg(&dest)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let stamp = |p: &std::path::Path| -> String {
+        String::from_utf8_lossy(
+            &Command::new("stat")
+                .args(["-c", "%Y"])
+                .arg(p)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string()
+    };
+    assert_eq!(
+        stamp(&src.join("readme.txt")),
+        stamp(&dest.join("readme.txt")),
+        "the modification time did not survive"
+    );
+}
+
+#[test]
+fn the_clamping_policy_ignores_source_timestamps() {
+    let s = Scratch::new("mtime-clamp");
+    let src = s.path("src");
+    make_tree(&src);
+
+    let first = s.path("first.stipple");
+    assert!(
+        build_image(&src, &first, &["--mtime", "zero"])
+            .status
+            .success()
+    );
+
+    assert!(
+        Command::new("find")
+            .arg(&src)
+            .args(["-exec", "touch", "-d", "1999-01-02 03:04:05", "{}", "+"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let second = s.path("second.stipple");
+    assert!(
+        build_image(&src, &second, &["--mtime", "zero"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&second).unwrap(),
+        "clamping should make source timestamps irrelevant"
+    );
+}
+
+#[test]
+fn the_preserving_policy_is_still_reproducible() {
+    let s = Scratch::new("mtime-repro");
+    let src = s.path("src");
+    make_tree(&src);
+    let a = s.path("a.stipple");
+    let b = s.path("b.stipple");
+    assert!(
+        build_image(&src, &a, &["--mtime", "preserve", "--threads", "1"])
+            .status
+            .success()
+    );
+    assert!(
+        build_image(&src, &b, &["--mtime", "preserve", "--threads", "4"])
+            .status
+            .success()
+    );
+    assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
 }

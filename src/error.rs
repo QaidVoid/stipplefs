@@ -27,6 +27,20 @@ pub enum Error {
         /// Major version this build implements.
         supported: u16,
     },
+    /// The image predates a layout change this build cannot interpret.
+    UnsupportedMinorVersion {
+        /// Minor version found in the image.
+        minor: u16,
+        /// Lowest minor version this build reads.
+        supported: u16,
+    },
+    /// The source tree holds something the format cannot record.
+    Unrepresentable {
+        /// Where it was found.
+        path: String,
+        /// What was wrong with it.
+        detail: &'static str,
+    },
     /// A stored digest did not match the bytes it covers.
     ChecksumMismatch {
         /// What the digest covers.
@@ -62,6 +76,13 @@ impl fmt::Display for Error {
                 f,
                 "image format version {major} is not supported by this build, which implements version {supported}"
             ),
+            Error::UnsupportedMinorVersion { minor, supported } => write!(
+                f,
+                "image format version 1.{minor} predates a layout change; this build reads 1.{supported} and later"
+            ),
+            Error::Unrepresentable { path, detail } => {
+                write!(f, "{path}: {detail}")
+            }
             Error::ChecksumMismatch { what } => write!(f, "{what} failed its integrity check"),
             Error::Malformed { detail } => write!(f, "malformed image: {detail}"),
             Error::UnsupportedCodec { missing } => write!(

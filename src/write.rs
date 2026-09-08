@@ -6,9 +6,10 @@
 use crate::chunk::{ChunkerConfig, chunks};
 use crate::error::{Error, Result};
 use crate::format::{
-    ALIGNMENT, BLOCK_ENTRY_SIZE, Codec, DIRENT_SIZE, EXTENT_SIZE, INODE_SIZE, MAGIC,
-    MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, S_IFDIR, S_IFLNK, S_IFREG, SECTION_COUNT, SUPERBLOCK_SIZE,
-    SectionKind, Superblock, VERSION_MAJOR, VERSION_MINOR,
+    ALIGNMENT, ATTR_ENTRY_SIZE, BLOCK_ENTRY_SIZE, Codec, DIRENT_SIZE, EXTENT_SIZE,
+    INODE_HEADER_SIZE, InodeWidths, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, S_IFBLK, S_IFCHR,
+    S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK, SECTION_COUNT, SUPERBLOCK_SIZE, SectionKind,
+    Superblock, VERSION_MAJOR, VERSION_MINOR,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -29,6 +30,20 @@ pub struct Options {
     pub dictionary_size: usize,
     /// Worker threads used to compress blocks. Output does not depend on this.
     pub threads: usize,
+    /// What to record for modification times.
+    pub timestamps: Timestamps,
+}
+
+/// What the writer records for modification times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Timestamps {
+    /// Record each entry's own time. Faithful, and reproducible for a given
+    /// set of times.
+    #[default]
+    Preserve,
+    /// Record one fixed value for every entry, so that trees differing only in
+    /// their timestamps produce byte-identical images.
+    Clamp,
 }
 
 impl Default for Options {
@@ -40,6 +55,7 @@ impl Default for Options {
             level: 19,
             dictionary_size: 112 * 1024,
             threads: 1,
+            timestamps: Timestamps::default(),
         }
     }
 }
@@ -78,6 +94,48 @@ pub enum Node {
         /// Owning group.
         gid: u32,
     },
+    /// A named pipe or a socket, neither of which carries content.
+    Special {
+        /// Which of the two.
+        kind: SpecialKind,
+        /// Permission bits, without the type.
+        mode: u32,
+        /// Owning user.
+        uid: u32,
+        /// Owning group.
+        gid: u32,
+    },
+    /// A character or block device.
+    Device {
+        /// Which of the two.
+        kind: DeviceKind,
+        /// Device number, major in the upper half.
+        rdev: u64,
+        /// Permission bits, without the type.
+        mode: u32,
+        /// Owning user.
+        uid: u32,
+        /// Owning group.
+        gid: u32,
+    },
+}
+
+/// Entries that carry neither content nor a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialKind {
+    /// A named pipe.
+    Fifo,
+    /// A socket.
+    Socket,
+}
+
+/// Entries that carry a device number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    /// A character device.
+    Char,
+    /// A block device.
+    Block,
 }
 
 #[derive(Default)]
@@ -93,10 +151,23 @@ enum Tree {
     Node(Node),
 }
 
+/// One extended attribute: a name and a value, both arbitrary bytes.
+pub type Xattr = (Vec<u8>, Vec<u8>);
+
+/// The set of extended attributes an entry carries, sorted by name.
+pub type XattrSet = Vec<Xattr>;
+
 /// Collects a tree and turns it into an image.
 pub struct Builder {
     options: Options,
     root: Dir,
+    /// Extended attributes, keyed by the same path used to insert the entry.
+    /// Kept beside the tree rather than inside every node kind, since any kind
+    /// may carry them and most carry none.
+    xattrs: BTreeMap<Vec<u8>, XattrSet>,
+    /// Modification times, keyed the same way. Every kind has one, so keeping
+    /// them beside the tree avoids repeating a field on every node kind.
+    mtimes: BTreeMap<Vec<u8>, u64>,
 }
 
 impl Builder {
@@ -120,7 +191,39 @@ impl Builder {
                 mode: 0o755,
                 ..Dir::default()
             },
+            xattrs: BTreeMap::new(),
+            mtimes: BTreeMap::new(),
         })
+    }
+
+    /// Record a modification time for the entry at `path`, in seconds.
+    ///
+    /// Ignored when the writer is clamping times.
+    pub fn set_mtime(&mut self, path: &[u8], seconds: u64) {
+        let key: Vec<u8> = path
+            .split(|&b| b == b'/')
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(&b'/');
+        self.mtimes.insert(key, seconds);
+    }
+
+    /// Attach extended attributes to the entry at `path`.
+    ///
+    /// Names are sorted and duplicates dropped, so the recorded order follows
+    /// the content rather than the order they were supplied.
+    pub fn set_xattrs(&mut self, path: &[u8], mut attrs: XattrSet) {
+        if attrs.is_empty() {
+            return;
+        }
+        attrs.sort();
+        attrs.dedup_by(|a, b| a.0 == b.0);
+        let key: Vec<u8> = path
+            .split(|&b| b == b'/')
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(&b'/');
+        self.xattrs.insert(key, attrs);
     }
 
     /// Add a node at `path`, whose components are separated by `/`.
@@ -193,6 +296,8 @@ struct InodeRec {
     uid: u32,
     gid: u32,
     nlink: u32,
+    mtime: u64,
+    xattr: Option<u32>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -212,6 +317,9 @@ struct Plan {
     stream: Vec<u8>,
     seen: HashMap<u128, u64>,
     links: HashMap<u64, u32>,
+    /// Distinct attribute sets, in order of first reference.
+    xattr_sets: Vec<XattrSet>,
+    xattr_index: HashMap<XattrSet, u32>,
 }
 
 impl Plan {
@@ -239,7 +347,7 @@ impl Builder {
         let cfg = ChunkerConfig::new(self.options.chunk_average);
         let mut plan = Plan::default();
         let root = plan.alloc();
-        self.visit(&self.root, root, &mut plan, &cfg)?;
+        self.visit(&self.root, root, &mut plan, &cfg, &[])?;
 
         let mut counts = vec![0u32; plan.inodes.len()];
         for d in &plan.dirents {
@@ -252,7 +360,14 @@ impl Builder {
         self.emit(plan)
     }
 
-    fn visit(&self, dir: &Dir, ino: u32, plan: &mut Plan, cfg: &ChunkerConfig) -> Result<()> {
+    fn visit(
+        &self,
+        dir: &Dir,
+        ino: u32,
+        plan: &mut Plan,
+        cfg: &ChunkerConfig,
+        prefix: &[u8],
+    ) -> Result<()> {
         let start = plan.dirents.len();
         plan.dirents
             .resize(start + dir.children.len(), DirentRec::default());
@@ -264,6 +379,8 @@ impl Builder {
             uid: dir.uid,
             gid: dir.gid,
             nlink: 0,
+            mtime: 0,
+            xattr: None,
         };
 
         for (i, (name, entry)) in dir.children.iter().enumerate() {
@@ -286,8 +403,38 @@ impl Builder {
             };
 
             match entry {
-                Tree::Dir(d) => self.visit(d, child, plan, cfg)?,
+                Tree::Dir(d) => {
+                    let mut nested = prefix.to_vec();
+                    if !nested.is_empty() {
+                        nested.push(b'/');
+                    }
+                    nested.extend_from_slice(name);
+                    self.visit(d, child, plan, cfg, &nested)?
+                }
                 Tree::Node(node) => self.emit_node(child, node, plan, cfg)?,
+            }
+
+            let mut key = prefix.to_vec();
+            if !key.is_empty() {
+                key.push(b'/');
+            }
+            key.extend_from_slice(name);
+            if self.options.timestamps == Timestamps::Preserve
+                && let Some(t) = self.mtimes.get(&key)
+            {
+                plan.inodes[child as usize].mtime = *t;
+            }
+            if let Some(attrs) = self.xattrs.get(&key) {
+                let at = match plan.xattr_index.get(attrs) {
+                    Some(at) => *at,
+                    None => {
+                        let at = plan.xattr_sets.len() as u32;
+                        plan.xattr_sets.push(attrs.clone());
+                        plan.xattr_index.insert(attrs.clone(), at);
+                        at
+                    }
+                };
+                plan.inodes[child as usize].xattr = Some(at);
             }
         }
         Ok(())
@@ -296,6 +443,51 @@ impl Builder {
     fn emit_node(&self, ino: u32, node: &Node, plan: &mut Plan, cfg: &ChunkerConfig) -> Result<()> {
         match node {
             Node::Directory { .. } => unreachable!("directories are visited, not emitted"),
+            Node::Special {
+                kind,
+                mode,
+                uid,
+                gid,
+            } => {
+                let type_bits = match kind {
+                    SpecialKind::Fifo => S_IFIFO,
+                    SpecialKind::Socket => S_IFSOCK,
+                };
+                plan.inodes[ino as usize] = InodeRec {
+                    size: 0,
+                    payload: 0,
+                    extent_count: 0,
+                    mode: type_bits | (mode & 0o7777),
+                    uid: *uid,
+                    gid: *gid,
+                    nlink: 0,
+                    mtime: 0,
+                    xattr: None,
+                };
+            }
+            Node::Device {
+                kind,
+                rdev,
+                mode,
+                uid,
+                gid,
+            } => {
+                let type_bits = match kind {
+                    DeviceKind::Char => S_IFCHR,
+                    DeviceKind::Block => S_IFBLK,
+                };
+                plan.inodes[ino as usize] = InodeRec {
+                    size: 0,
+                    payload: *rdev,
+                    extent_count: 0,
+                    mode: type_bits | (mode & 0o7777),
+                    uid: *uid,
+                    gid: *gid,
+                    nlink: 0,
+                    mtime: 0,
+                    xattr: None,
+                };
+            }
             Node::Symlink { target, uid, gid } => {
                 let at = plan.intern(target)?;
                 plan.inodes[ino as usize] = InodeRec {
@@ -306,6 +498,8 @@ impl Builder {
                     uid: *uid,
                     gid: *gid,
                     nlink: 0,
+                    mtime: 0,
+                    xattr: None,
                 };
             }
             Node::File {
@@ -330,6 +524,8 @@ impl Builder {
                     uid: *uid,
                     gid: *gid,
                     nlink: 0,
+                    mtime: 0,
+                    xattr: None,
                 };
             }
         }
@@ -477,17 +673,8 @@ impl Builder {
     }
 
     fn emit(&self, plan: Plan) -> Result<Vec<u8>> {
-        let mut inodes = Vec::with_capacity(plan.inodes.len() * INODE_SIZE);
-        for r in &plan.inodes {
-            inodes.extend_from_slice(&r.size.to_le_bytes());
-            inodes.extend_from_slice(&r.payload.to_le_bytes());
-            inodes.extend_from_slice(&r.extent_count.to_le_bytes());
-            inodes.extend_from_slice(&r.mode.to_le_bytes());
-            inodes.extend_from_slice(&r.uid.to_le_bytes());
-            inodes.extend_from_slice(&r.gid.to_le_bytes());
-            inodes.extend_from_slice(&r.nlink.to_le_bytes());
-            inodes.extend_from_slice(&0u32.to_le_bytes());
-        }
+        let (inodes, attributes) = encode_inodes(&plan.inodes);
+        let xattrs = encode_xattrs(&plan.xattr_sets);
 
         let mut dirents = Vec::with_capacity(plan.dirents.len() * DIRENT_SIZE);
         for d in &plan.dirents {
@@ -517,6 +704,8 @@ impl Builder {
             (SectionKind::Dirents, dirents),
             (SectionKind::Names, plan.names),
             (SectionKind::Extents, extents),
+            (SectionKind::Attributes, attributes),
+            (SectionKind::ExtendedAttributes, xattrs),
         ] {
             if !content.is_empty() {
                 sections.push((kind, content));
@@ -600,6 +789,61 @@ impl Builder {
     }
 }
 
+/// The extended attributes recorded on `path`, without following a symlink.
+///
+/// Returns an empty vector when the entry has none, or when the underlying
+/// filesystem does not support them.
+#[cfg(feature = "fs")]
+fn read_xattrs(path: &std::path::Path) -> XattrSet {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut raw: Vec<u8> = path.as_os_str().as_bytes().to_vec();
+    raw.push(0);
+    let c_path = raw.as_ptr() as *const libc::c_char;
+
+    // SAFETY: `c_path` is a nul-terminated path that outlives both calls. The
+    // first passes a null buffer to ask for the size, which is how the
+    // interface is defined; the second passes a buffer of exactly that size.
+    let needed = unsafe { libc::llistxattr(c_path, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return Vec::new();
+    }
+    let mut names = vec![0u8; needed as usize];
+    let got =
+        unsafe { libc::llistxattr(c_path, names.as_mut_ptr() as *mut libc::c_char, names.len()) };
+    if got <= 0 {
+        return Vec::new();
+    }
+    names.truncate(got as usize);
+
+    let mut out = Vec::new();
+    for name in names.split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        let mut key: Vec<u8> = name.to_vec();
+        key.push(0);
+        let k = key.as_ptr() as *const libc::c_char;
+        // SAFETY: same contract as above, for one named attribute.
+        let size = unsafe { libc::lgetxattr(c_path, k, std::ptr::null_mut(), 0) };
+        if size < 0 {
+            continue;
+        }
+        let mut value = vec![0u8; size as usize];
+        let got = unsafe {
+            libc::lgetxattr(
+                c_path,
+                k,
+                value.as_mut_ptr() as *mut libc::c_void,
+                value.len(),
+            )
+        };
+        if got < 0 {
+            continue;
+        }
+        value.truncate(got as usize);
+        out.push((name.to_vec(), value));
+    }
+    out
+}
+
 #[cfg(feature = "fs")]
 impl Builder {
     /// Add every entry under `root`, in a canonical order.
@@ -631,6 +875,12 @@ impl Builder {
             };
             let meta = std::fs::symlink_metadata(&path)?;
             let mode = meta.permissions().mode() & 0o7777;
+            let found = read_xattrs(&path);
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
 
             let mut full = prefix.to_vec();
             if !full.is_empty() {
@@ -671,8 +921,205 @@ impl Builder {
                         link_group,
                     },
                 )?;
+            } else {
+                // Anything else is recorded by its type bits, or the build
+                // stops. Skipping silently is how pipes, sockets and device
+                // nodes used to vanish without a word.
+                use std::os::unix::fs::FileTypeExt;
+                let t = meta.file_type();
+                let node = if t.is_fifo() {
+                    Node::Special {
+                        kind: SpecialKind::Fifo,
+                        mode,
+                        uid: meta.uid(),
+                        gid: meta.gid(),
+                    }
+                } else if t.is_socket() {
+                    Node::Special {
+                        kind: SpecialKind::Socket,
+                        mode,
+                        uid: meta.uid(),
+                        gid: meta.gid(),
+                    }
+                } else if t.is_char_device() || t.is_block_device() {
+                    Node::Device {
+                        kind: if t.is_char_device() {
+                            DeviceKind::Char
+                        } else {
+                            DeviceKind::Block
+                        },
+                        rdev: meta.rdev(),
+                        mode,
+                        uid: meta.uid(),
+                        gid: meta.gid(),
+                    }
+                } else {
+                    return Err(Error::Unrepresentable {
+                        path: path.display().to_string(),
+                        detail: "the format has no kind for this entry",
+                    });
+                };
+                self.insert(&full, node)?;
+            }
+            if !found.is_empty() {
+                self.set_xattrs(&full, found);
+            }
+            if let Some(t) = modified {
+                self.set_mtime(&full, t);
             }
         }
         Ok(())
     }
+}
+
+/// Smallest number of bytes that represents every value in `values`.
+fn width_for(values: impl Iterator<Item = u64>) -> u8 {
+    let max = values.max().unwrap_or(0);
+    let bits = 64 - max.leading_zeros();
+    (bits.div_ceil(8)).max(1) as u8
+}
+
+/// Encode the inode arrays and the attribute table they index.
+///
+/// Each array's width is the smallest that holds every value it must carry, so
+/// the widths follow from the content rather than from a fixed guess about how
+/// large a tree might be.
+fn encode_inodes(records: &[InodeRec]) -> (Vec<u8>, Vec<u8>) {
+    if records.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Distinct (mode, uid, gid) tuples, sorted so the order follows content.
+    let mut tuples: Vec<(u32, u32, u32)> = records.iter().map(|r| (r.mode, r.uid, r.gid)).collect();
+    tuples.sort_unstable();
+    tuples.dedup();
+    let index_of: HashMap<(u32, u32, u32), u32> = tuples
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (*t, i as u32))
+        .collect();
+
+    let mut attributes = Vec::with_capacity(tuples.len() * ATTR_ENTRY_SIZE);
+    for (mode, uid, gid) in &tuples {
+        attributes.extend_from_slice(&mode.to_le_bytes());
+        attributes.extend_from_slice(&uid.to_le_bytes());
+        attributes.extend_from_slice(&gid.to_le_bytes());
+    }
+
+    let times: Vec<u64> = records.iter().map(|r| r.mtime).collect();
+    let recorded = times.iter().any(|t| *t != 0);
+    let mtime_base = if recorded {
+        times.iter().copied().min().unwrap_or(0)
+    } else {
+        0
+    };
+    let any_xattr = records.iter().any(|r| r.xattr.is_some());
+
+    let widths = InodeWidths {
+        size: width_for(records.iter().map(|r| r.size)),
+        payload: width_for(records.iter().map(|r| r.payload)),
+        attrs: width_for(std::iter::once(tuples.len().saturating_sub(1) as u64)),
+        nlink: width_for(records.iter().map(|r| r.nlink as u64)),
+        mtime: if recorded {
+            width_for(times.iter().map(|t| t - mtime_base))
+        } else {
+            0
+        },
+        xattr: if any_xattr {
+            width_for(records.iter().map(|r| r.xattr.map_or(0, |x| x as u64 + 1)))
+        } else {
+            0
+        },
+        extents: width_for(records.iter().map(|r| r.extent_count as u64)),
+        mtime_base,
+    };
+
+    let mut out = Vec::with_capacity(INODE_HEADER_SIZE + widths.per_inode() * records.len());
+    out.push(widths.size);
+    out.push(widths.payload);
+    out.push(widths.attrs);
+    out.push(widths.nlink);
+    out.push(widths.mtime);
+    out.push(widths.xattr);
+    out.push(widths.extents);
+    out.push(0);
+    out.extend_from_slice(&widths.mtime_base.to_le_bytes());
+
+    let push = |value: u64, width: u8, out: &mut Vec<u8>| {
+        if width > 0 {
+            out.extend_from_slice(&value.to_le_bytes()[..width as usize]);
+        }
+    };
+    for r in records {
+        push(r.size, widths.size, &mut out);
+    }
+    for r in records {
+        push(r.payload, widths.payload, &mut out);
+    }
+    for r in records {
+        let at = index_of[&(r.mode, r.uid, r.gid)];
+        push(at as u64, widths.attrs, &mut out);
+    }
+    for r in records {
+        push(r.nlink as u64, widths.nlink, &mut out);
+    }
+    for r in records {
+        push(r.mtime.saturating_sub(mtime_base), widths.mtime, &mut out);
+    }
+    for r in records {
+        push(r.xattr.map_or(0, |x| x as u64 + 1), widths.xattr, &mut out);
+    }
+    for r in records {
+        push(r.extent_count as u64, widths.extents, &mut out);
+    }
+    (out, attributes)
+}
+
+/// Encode the extended attribute section.
+///
+/// Names and values share one pool and a repeated one is stored once, so a
+/// tree where every file carries the same attribute name pays for that name a
+/// single time.
+fn encode_xattrs(sets: &[XattrSet]) -> Vec<u8> {
+    if sets.is_empty() {
+        return Vec::new();
+    }
+    let mut pool: Vec<u8> = Vec::new();
+    let mut at: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+    let intern = |bytes: &[u8], pool: &mut Vec<u8>, at: &mut BTreeMap<Vec<u8>, u32>| -> u32 {
+        if let Some(off) = at.get(bytes) {
+            return *off;
+        }
+        let off = pool.len() as u32;
+        pool.extend_from_slice(bytes);
+        at.insert(bytes.to_vec(), off);
+        off
+    };
+
+    let mut starts: Vec<u32> = Vec::with_capacity(sets.len() + 1);
+    let mut pairs: Vec<u8> = Vec::new();
+    let mut count = 0u32;
+    for set in sets {
+        starts.push(count);
+        for (name, value) in set {
+            let name_off = intern(name, &mut pool, &mut at);
+            let value_off = intern(value, &mut pool, &mut at);
+            pairs.extend_from_slice(&name_off.to_le_bytes());
+            pairs.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            pairs.extend_from_slice(&value_off.to_le_bytes());
+            pairs.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            count += 1;
+        }
+    }
+    starts.push(count);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(sets.len() as u32).to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    for s in &starts {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out.extend_from_slice(&pairs);
+    out.extend_from_slice(&pool);
+    out
 }

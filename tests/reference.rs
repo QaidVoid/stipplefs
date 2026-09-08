@@ -48,7 +48,7 @@ impl Reference {
         );
 
         let mut sections = Vec::new();
-        for i in 0..6 {
+        for i in 0..8 {
             let base = 56 + i * 16;
             let off = u64at(&image, base);
             let size = u64at(&image, base + 8);
@@ -76,19 +76,49 @@ impl Reference {
         &self.sections[i]
     }
 
+    /// Read one inode from the parallel arrays, following `docs/format.md`
+    /// directly rather than reusing anything from the crate.
+    ///
+    /// Returns size, payload, extent count, mode, uid, gid and link count.
     fn inode(&self, ino: u32) -> (u64, u64, u32, u32, u32, u32, u32) {
         assert!(ino < self.inode_count);
         let s = self.section(0);
-        let at = ino as usize * 40;
-        (
-            u64at(s, at),
-            u64at(s, at + 8),
-            u32at(s, at + 16),
-            u32at(s, at + 20),
-            u32at(s, at + 24),
-            u32at(s, at + 28),
-            u32at(s, at + 32),
-        )
+        let (ws, wp, wa, wn, wm, wx, we) = (s[0], s[1], s[2], s[3], s[4], s[5], s[6]);
+        let n = self.inode_count as usize;
+        let body = &s[16..];
+
+        // Each array follows the previous one, so walking to a field means
+        // stepping past every array before it.
+        let read = |base: usize, width: u8, i: usize| -> u64 {
+            if width == 0 {
+                return 0;
+            }
+            let at = base + i * width as usize;
+            let mut v = [0u8; 8];
+            v[..width as usize].copy_from_slice(&body[at..at + width as usize]);
+            u64::from_le_bytes(v)
+        };
+        let i = ino as usize;
+        let mut base = 0usize;
+        let size = read(base, ws, i);
+        base += n * ws as usize;
+        let payload = read(base, wp, i);
+        base += n * wp as usize;
+        let attrs = read(base, wa, i) as usize;
+        base += n * wa as usize;
+        let nlink = read(base, wn, i) as u32;
+        base += n * wn as usize;
+        base += n * wm as usize;
+        base += n * wx as usize;
+        let extent_count = read(base, we, i) as u32;
+
+        let attr_section = self.section(6);
+        let at = attrs * 12;
+        let mode = u32at(attr_section, at);
+        let uid = u32at(attr_section, at + 4);
+        let gid = u32at(attr_section, at + 8);
+
+        (size, payload, extent_count, mode, uid, gid, nlink)
     }
 
     fn decode_block(&self, index: usize) -> Vec<u8> {
@@ -318,6 +348,7 @@ fn every_writer_option_combination_round_trips() {
                         threads,
                         level: 3,
                         dictionary_size: 65536,
+                        timestamps: stipplefs::write::Timestamps::Clamp,
                     };
                     let (image, expected) = random_tree(9, opts);
                     let reference = Reference::open(image.clone());
@@ -358,30 +389,25 @@ mod reference_writer {
     /// Build an image holding a flat directory of files, in name order.
     pub fn build(files: &BTreeMap<Vec<u8>, Entry>, block_size: u32) -> Vec<u8> {
         let mut stream = Vec::new();
-        let mut inodes: Vec<[u8; 40]> = Vec::new();
+        let mut inodes: Vec<(u64, u64, u32, u32, u32)> = Vec::new();
         let mut dirents: Vec<[u8; 12]> = Vec::new();
         let mut names: Vec<u8> = Vec::new();
 
-        let mut root = [0u8; 40];
-        root[0..8].copy_from_slice(&(files.len() as u64).to_le_bytes());
-        root[8..16].copy_from_slice(&0u64.to_le_bytes());
-        root[20..24].copy_from_slice(&(0o040755u32).to_le_bytes());
-        root[32..36].copy_from_slice(&2u32.to_le_bytes());
-        inodes.push(root);
+        // (size, payload, extent_count, mode, nlink)
+        inodes.push((files.len() as u64, 0u64, 0u32, 0o040755u32, 2u32));
 
         for (name, entry) in files {
             let ino = inodes.len() as u32;
             let at = stream.len() as u64;
             stream.extend_from_slice(&entry.content);
 
-            let mut rec = [0u8; 40];
-            rec[0..8].copy_from_slice(&(entry.content.len() as u64).to_le_bytes());
-            rec[8..16].copy_from_slice(&at.to_le_bytes());
-            rec[16..20]
-                .copy_from_slice(&(if entry.content.is_empty() { 0u32 } else { 1 }).to_le_bytes());
-            rec[20..24].copy_from_slice(&(0o100644u32).to_le_bytes());
-            rec[32..36].copy_from_slice(&1u32.to_le_bytes());
-            inodes.push(rec);
+            inodes.push((
+                entry.content.len() as u64,
+                at,
+                if entry.content.is_empty() { 0u32 } else { 1 },
+                0o100644u32,
+                1u32,
+            ));
 
             let mut d = [0u8; 12];
             d[0..4].copy_from_slice(&ino.to_le_bytes());
@@ -392,7 +418,34 @@ mod reference_writer {
         }
 
         let blocks: Vec<&[u8]> = stream.chunks(block_size as usize).collect();
-        let inode_bytes: Vec<u8> = inodes.iter().flatten().copied().collect();
+        // Widths wide enough for anything this naive writer produces.
+        let mut inode_bytes: Vec<u8> = vec![8, 8, 1, 4, 0, 0, 4, 0];
+        inode_bytes.extend_from_slice(&0u64.to_le_bytes());
+        for (size, ..) in &inodes {
+            inode_bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for (_, payload, ..) in &inodes {
+            inode_bytes.extend_from_slice(&payload.to_le_bytes());
+        }
+        let mut modes: Vec<u32> = inodes.iter().map(|r| r.3).collect();
+        modes.sort_unstable();
+        modes.dedup();
+        for r in &inodes {
+            let at = modes.iter().position(|m| *m == r.3).unwrap();
+            inode_bytes.push(at as u8);
+        }
+        for r in &inodes {
+            inode_bytes.extend_from_slice(&r.4.to_le_bytes());
+        }
+        for r in &inodes {
+            inode_bytes.extend_from_slice(&r.2.to_le_bytes());
+        }
+        let mut attr_bytes: Vec<u8> = Vec::new();
+        for m in &modes {
+            attr_bytes.extend_from_slice(&m.to_le_bytes());
+            attr_bytes.extend_from_slice(&0u32.to_le_bytes());
+            attr_bytes.extend_from_slice(&0u32.to_le_bytes());
+        }
         let dirent_bytes: Vec<u8> = dirents.iter().flatten().copied().collect();
 
         let sized = |n: usize| -> u64 {
@@ -407,6 +460,7 @@ mod reference_writer {
             (1, dirent_bytes),
             (2, names),
             (4, vec![0u8; blocks.len() * 20]),
+            (6, attr_bytes),
         ]
         .into_iter()
         .filter(|(_, c)| !c.is_empty())
@@ -428,7 +482,7 @@ mod reference_writer {
             at += b.len() as u64 + 8;
         }
 
-        let mut placed = [(0u64, 0u64); 6];
+        let mut placed = [(0u64, 0u64); 8];
         let mut body = Vec::new();
         let mut cursor = 4096u64;
         for (slot, content) in &present {
@@ -449,6 +503,7 @@ mod reference_writer {
         let mut sb = [0u8; 4096];
         sb[0..8].copy_from_slice(b"STIPPLE\0");
         sb[8..10].copy_from_slice(&1u16.to_le_bytes());
+        sb[10..12].copy_from_slice(&1u16.to_le_bytes());
         sb[14..16].copy_from_slice(&1u16.to_le_bytes());
         sb[16..24].copy_from_slice(&total.to_le_bytes());
         sb[24..32].copy_from_slice(&(stream.len() as u64).to_le_bytes());

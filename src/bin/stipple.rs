@@ -101,6 +101,113 @@ impl Located {
     }
 }
 
+/// Create a named pipe, socket or device node at `at`.
+///
+/// `std` offers no way to make any of these, so this calls `mknod` directly.
+fn create_special(at: &Path, kind: FileType, mode: u32, rdev: u64) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let type_bits = match kind {
+        FileType::Fifo => libc::S_IFIFO,
+        FileType::Socket => libc::S_IFSOCK,
+        FileType::CharDevice => libc::S_IFCHR,
+        FileType::BlockDevice => libc::S_IFBLK,
+        _ => return Err(format!("{}: not a special entry", at.display())),
+    };
+
+    let mut raw: Vec<u8> = at.as_os_str().as_bytes().to_vec();
+    raw.push(0);
+
+    // SAFETY: `raw` is a nul-terminated path that outlives the call, and the
+    // mode and device number are plain integers. `mknod` reports failure
+    // through its return value, which is checked below.
+    let rc = unsafe {
+        libc::mknod(
+            raw.as_ptr() as *const libc::c_char,
+            type_bits | (mode & 0o7777),
+            rdev as libc::dev_t,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    Err(format!(
+        "{}: creating this entry failed: {err}",
+        at.display()
+    ))
+}
+
+/// Attach extended attributes to an entry that has just been extracted.
+fn restore_xattrs(at: &Path, attrs: &[(&[u8], &[u8])]) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    if attrs.is_empty() {
+        return Ok(());
+    }
+    let mut raw: Vec<u8> = at.as_os_str().as_bytes().to_vec();
+    raw.push(0);
+    for (name, value) in attrs {
+        let mut key: Vec<u8> = name.to_vec();
+        key.push(0);
+        // SAFETY: both the path and the name are nul-terminated and outlive
+        // the call, and the value pointer and length describe one slice.
+        let rc = unsafe {
+            libc::lsetxattr(
+                raw.as_ptr() as *const libc::c_char,
+                key.as_ptr() as *const libc::c_char,
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "{}: setting extended attribute {}: {}",
+                at.display(),
+                String::from_utf8_lossy(name),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Restore an entry's modification time, without following a symlink.
+fn restore_mtime(at: &Path, seconds: u64) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut raw: Vec<u8> = at.as_os_str().as_bytes().to_vec();
+    raw.push(0);
+    let times = [
+        libc::timespec {
+            tv_sec: seconds as libc::time_t,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: seconds as libc::time_t,
+            tv_nsec: 0,
+        },
+    ];
+    // SAFETY: the path is nul-terminated and outlives the call, and `times`
+    // is a two element array as the interface requires.
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            raw.as_ptr() as *const libc::c_char,
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: setting the modification time: {}",
+            at.display(),
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
 fn walk(
     r: &Reader<'_>,
     ino: u32,
@@ -132,6 +239,9 @@ fn check(located: Located) -> Result<(), String> {
     let mut files = 0u64;
     let mut dirs = 0u64;
     let mut links = 0u64;
+    let mut fifos = 0u64;
+    let mut sockets = 0u64;
+    let mut devices = 0u64;
     let mut bytes = 0u64;
     let mut checked = 0u64;
     walk(&reader, 0, Path::new(""), &mut |_, ino| {
@@ -139,6 +249,9 @@ fn check(located: Located) -> Result<(), String> {
         match node.file_type() {
             Some(FileType::Directory) => dirs += 1,
             Some(FileType::Symlink) => links += 1,
+            Some(FileType::Fifo) => fifos += 1,
+            Some(FileType::Socket) => sockets += 1,
+            Some(FileType::CharDevice) | Some(FileType::BlockDevice) => devices += 1,
             Some(FileType::Regular) => {
                 files += 1;
                 bytes += node.size;
@@ -166,9 +279,39 @@ fn check(located: Located) -> Result<(), String> {
     println!("inodes          {}", sb.inode_count);
     println!("extents         {}", sb.extent_count);
     println!("codecs          {:#06x}", sb.codec_mask);
+
+    use stipplefs::format::SectionKind;
+    let sections = [
+        ("inodes", SectionKind::Inodes),
+        ("dirents", SectionKind::Dirents),
+        ("names", SectionKind::Names),
+        ("extents", SectionKind::Extents),
+        ("blocks", SectionKind::Blocks),
+        ("dictionary", SectionKind::Dictionaries),
+    ];
+    let mut metadata = 0u64;
+    println!("sections");
+    for (label, kind) in sections {
+        let section = sb.section(kind);
+        metadata += section.size;
+        println!(
+            "  {label:<12} {:>12} bytes at {:>12}",
+            section.size, section.offset
+        );
+    }
+    println!(
+        "  {:<12} {:>12} bytes  ({:.1} per inode, {:.2}% of image)",
+        "metadata",
+        metadata,
+        metadata as f64 / sb.inode_count.max(1) as f64,
+        100.0 * metadata as f64 / sb.image_length as f64,
+    );
     println!("directories     {dirs}");
     println!("files           {files} ({bytes} bytes)");
     println!("symlinks        {links}");
+    println!("pipes           {fifos}");
+    println!("sockets         {sockets}");
+    println!("devices         {devices}");
     println!("verified        {checked} bytes read and checksummed");
     Ok(())
 }
@@ -212,6 +355,22 @@ fn extract(located: Located, destination: PathBuf, subtree: Option<String>) -> R
                 std::os::unix::fs::symlink(&text, &target)
                     .map_err(|e| format!("{}: {e}", target.display()))?;
             }
+            Some(
+                kind @ (FileType::Fifo
+                | FileType::Socket
+                | FileType::CharDevice
+                | FileType::BlockDevice),
+            ) => {
+                if want.is_some_and(|w| !path.starts_with(w)) {
+                    return Ok(());
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("{}: {e}", parent.display()))?;
+                }
+                let _ = std::fs::remove_file(&target);
+                create_special(&target, kind, node.mode, node.device().unwrap_or(0))?;
+            }
             Some(FileType::Regular) => {
                 if want.is_some_and(|w| !path.starts_with(w)) {
                     return Ok(());
@@ -235,6 +394,13 @@ fn extract(located: Located, destination: PathBuf, subtree: Option<String>) -> R
                 wrote += node.size;
             }
             None => return Err(format!("inode {ino} has an unrecognised type")),
+        }
+        if want.is_none_or(|w| path.starts_with(w)) {
+            let attrs = reader.xattrs(ino).map_err(|e| e.to_string())?;
+            restore_xattrs(&target, &attrs)?;
+            if let Some(t) = node.mtime {
+                restore_mtime(&target, t)?;
+            }
         }
         Ok(())
     })?;

@@ -4,7 +4,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use stipplefs::format::Codec;
-use stipplefs::write::{Builder, Options};
+use stipplefs::write::{Builder, Options, Timestamps};
 
 #[derive(Parser)]
 #[command(
@@ -34,6 +34,20 @@ struct Args {
     /// Worker threads. Output does not depend on this.
     #[arg(long, default_value_t = 1)]
     threads: usize,
+    /// What to record for modification times. `preserve` keeps each entry's
+    /// own time; `zero` records one fixed value, which is what makes two
+    /// builds of the same content byte-identical across machines.
+    #[arg(long, value_enum, default_value_t = MtimePolicy::Preserve)]
+    mtime: MtimePolicy,
+}
+
+/// How `--mtime` is spelled on the command line.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum MtimePolicy {
+    /// Record each entry's own modification time.
+    Preserve,
+    /// Record one fixed value for every entry.
+    Zero,
 }
 
 fn run(args: Args) -> Result<(), String> {
@@ -56,6 +70,10 @@ fn run(args: Args) -> Result<(), String> {
             args.dictionary_size
         },
         threads: args.threads.max(1),
+        timestamps: match args.mtime {
+            MtimePolicy::Preserve => Timestamps::Preserve,
+            MtimePolicy::Zero => Timestamps::Clamp,
+        },
     };
 
     let mut builder = Builder::new(options).map_err(|e| e.to_string())?;

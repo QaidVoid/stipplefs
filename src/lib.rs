@@ -18,3 +18,9 @@ pub mod read;
 
 #[cfg(feature = "read")]
 pub mod source;
+
+#[cfg(feature = "write")]
+pub mod chunk;
+
+#[cfg(feature = "write")]
+pub mod write;

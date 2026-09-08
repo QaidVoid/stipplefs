@@ -1,0 +1,22 @@
+[package]
+name = "stipplefs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[features]
+default = ["read", "write"]
+read = []
+write = []
+cli = []
+mount = ["read"]
+
+[[bin]]
+name = "stipple"
+required-features = ["read", "cli"]
+
+[[bin]]
+name = "mkstipple"
+required-features = ["write", "cli"]

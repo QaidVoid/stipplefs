@@ -21,6 +21,7 @@ mount = ["dep:fuser", "read", "fs"]
 mmap = ["dep:memmap2", "fs", "read"]
 zstd = ["dep:zstd"]
 dict = ["zstd", "zstd/zdict_builder"]
+metrics = ["read"]
 
 [[bin]]
 name = "stipple"

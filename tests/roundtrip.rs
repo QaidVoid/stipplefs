@@ -247,20 +247,28 @@ fn block_and_chunk_sizes_are_configurable_and_round_trip() {
 
 #[test]
 fn a_bad_block_size_is_rejected() {
-    assert!(
-        Builder::new(Options {
-            block_size: 5000,
-            ..Options::default()
-        })
-        .is_err()
-    );
-    assert!(
-        Builder::new(Options {
-            block_size: 1 << 24,
-            ..Options::default()
-        })
-        .is_err()
-    );
+    for bad in [5000u32, 2048, 0] {
+        assert!(
+            Builder::new(Options {
+                block_size: bad,
+                ..Options::default()
+            })
+            .is_err(),
+            "block size {bad} should be rejected"
+        );
+    }
+    // Large blocks are permitted. The format does not choose a point on the
+    // curve between compression ratio and the cost of serving one small read.
+    for ok in [1u32 << 24, 1 << 26, 1 << 30] {
+        assert!(
+            Builder::new(Options {
+                block_size: ok,
+                ..Options::default()
+            })
+            .is_ok(),
+            "block size {ok} should be accepted"
+        );
+    }
 }
 
 #[test]

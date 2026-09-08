@@ -34,6 +34,17 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         threads: usize,
     },
+    /// Time random reads served directly by the library, without FUSE.
+    Bench {
+        #[command(flatten)]
+        image: Located,
+        /// Random 4 KiB reads to perform.
+        #[arg(long, default_value_t = 2000)]
+        reads: usize,
+        /// Seed, so a run can be repeated exactly.
+        #[arg(long, default_value_t = 20260908)]
+        seed: u64,
+    },
     /// Write an image's contents to a directory.
     Extract {
         #[command(flatten)]
@@ -59,6 +70,10 @@ struct Located {
     /// Bytes of decoded blocks the reader may retain.
     #[arg(long, default_value_t = DEFAULT_CACHE_BUDGET)]
     cache_budget: usize,
+    /// Map the image instead of reading it, so blocks are taken in place.
+    #[cfg(feature = "mmap")]
+    #[arg(long)]
+    mmap: bool,
 }
 
 impl Located {
@@ -67,6 +82,19 @@ impl Located {
             .map_err(|e| format!("{}: {e}", self.path.display()))?
             .len();
         let length = self.length.unwrap_or(size.saturating_sub(self.offset));
+
+        #[cfg(feature = "mmap")]
+        if self.mmap {
+            let file = std::fs::File::open(&self.path)
+                .map_err(|e| format!("{}: {e}", self.path.display()))?;
+            // SAFETY: the caller has asked for a mapping and is responsible for
+            // the image not being modified while it is mounted.
+            let source = unsafe { stipplefs::source::MmapSource::new(&file) }
+                .map_err(|e| format!("{}: {e}", self.path.display()))?;
+            return Image::new(source, self.offset, length)
+                .map_err(|e| format!("{}: {e}", self.path.display()));
+        }
+
         Image::open_at(&self.path, self.offset, length)
             .map_err(|e| format!("{}: {e}", self.path.display()))
     }
@@ -238,10 +266,70 @@ fn mount(
     fuser::mount(fs, &mountpoint, &config).map_err(|e| format!("mounting: {e}"))
 }
 
+fn bench(located: Located, reads: usize, seed: u64) -> Result<(), String> {
+    let image = located.open()?;
+    let reader = image
+        .reader_with_budget(located.cache_budget)
+        .map_err(|e| e.to_string())?;
+
+    let mut files: Vec<(u32, u64)> = Vec::new();
+    walk(&reader, 0, Path::new(""), &mut |_, ino| {
+        if let Some(node) = reader.inode(ino)
+            && node.file_type() == Some(FileType::Regular)
+            && node.size >= 4096
+        {
+            files.push((ino, node.size));
+        }
+        Ok(())
+    })?;
+    if files.is_empty() {
+        return Err("no files of at least 4 KiB in the image".into());
+    }
+
+    // The same cheap generator the external harness uses, so the two are
+    // reading comparable distributions.
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let picks: Vec<(u32, u64)> = (0..reads)
+        .map(|_| {
+            let (ino, size) = files[(next() % files.len() as u64) as usize];
+            (ino, (next() % (size - 4096).max(1)) & !4095)
+        })
+        .collect();
+
+    let mut buf = [0u8; 4096];
+    let mut got = 0u64;
+    let start = std::time::Instant::now();
+    for (ino, offset) in &picks {
+        got += reader
+            .read(*ino, *offset, &mut buf)
+            .map_err(|e| e.to_string())? as u64;
+    }
+    let elapsed = start.elapsed();
+
+    println!("files eligible {}", files.len());
+    println!("reads          {reads}");
+    println!("bytes          {got}");
+    println!("elapsed        {:.3} s", elapsed.as_secs_f64());
+    println!(
+        "rate           {:.1} reads/s",
+        reads as f64 / elapsed.as_secs_f64()
+    );
+    println!();
+    print!("{}", reader.metrics().report());
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let outcome = match args.command {
         Command::Check(located) => check(located),
+        Command::Bench { image, reads, seed } => bench(image, reads, seed),
         #[cfg(feature = "mount")]
         Command::Mount {
             image,

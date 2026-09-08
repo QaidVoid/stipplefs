@@ -93,12 +93,11 @@ impl Reference {
 
     fn decode_block(&self, index: usize) -> Vec<u8> {
         let blocks = self.section(4);
-        let at = index * 16;
+        let at = index * 20;
         let image_offset = u64at(blocks, at) as usize;
         let stored_length = u32at(blocks, at + 8) as usize;
-        let decoded_length =
-            u32::from_le_bytes([blocks[at + 12], blocks[at + 13], blocks[at + 14], 0]) as usize;
-        let codec = blocks[at + 15];
+        let decoded_length = u32at(blocks, at + 12) as usize;
+        let codec = blocks[at + 16];
 
         let raw = &self.image[image_offset..image_offset + stored_length];
         let want = u64at(&self.image, image_offset + stored_length);
@@ -407,7 +406,7 @@ mod reference_writer {
             (0usize, inode_bytes),
             (1, dirent_bytes),
             (2, names),
-            (4, vec![0u8; blocks.len() * 16]),
+            (4, vec![0u8; blocks.len() * 20]),
         ]
         .into_iter()
         .filter(|(_, c)| !c.is_empty())
@@ -423,8 +422,9 @@ mod reference_writer {
         for b in &blocks {
             index.extend_from_slice(&at.to_le_bytes());
             index.extend_from_slice(&(b.len() as u32).to_le_bytes());
-            index.extend_from_slice(&(b.len() as u32).to_le_bytes()[..3]);
+            index.extend_from_slice(&(b.len() as u32).to_le_bytes());
             index.push(0);
+            index.extend_from_slice(&[0u8; 3]);
             at += b.len() as u64 + 8;
         }
 

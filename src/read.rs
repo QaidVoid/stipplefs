@@ -2,9 +2,9 @@
 
 use crate::error::{Error, Result};
 use crate::format::{
-    ALIGNMENT, Codec, DIRENT_SIZE, Dirent, EXTENT_SIZE, Extent, FileType, INODE_SIZE, Inode, MAGIC,
-    MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, SECTION_COUNT, SUPERBLOCK_SIZE, Section, SectionKind,
-    Superblock, VERSION_MAJOR, supported_codecs,
+    ALIGNMENT, BLOCK_ENTRY_SIZE, Codec, DIRENT_SIZE, Dirent, EXTENT_SIZE, Extent, FileType,
+    INODE_SIZE, Inode, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, SECTION_COUNT, SUPERBLOCK_SIZE,
+    Section, SectionKind, Superblock, VERSION_MAJOR, supported_codecs,
 };
 use crate::source::{ByteSource, Region};
 
@@ -207,9 +207,6 @@ pub struct BlockEntry {
     pub codec: Codec,
 }
 
-/// Size of one block index entry.
-pub const BLOCK_ENTRY_SIZE: usize = 16;
-
 /// The block index, parsed on demand rather than materialised.
 pub struct BlockIndex<'a> {
     bytes: SectionData<'a>,
@@ -234,8 +231,8 @@ impl BlockIndex<'_> {
         Some(BlockEntry {
             image_offset: u64::from_le_bytes(off),
             stored_length: u32::from_le_bytes([e[8], e[9], e[10], e[11]]),
-            decoded_length: u32::from_le_bytes([e[12], e[13], e[14], 0]),
-            codec: Codec::from_id(e[15])?,
+            decoded_length: u32::from_le_bytes([e[12], e[13], e[14], e[15]]),
+            codec: Codec::from_id(e[16])?,
         })
     }
 }
@@ -382,6 +379,7 @@ pub struct Reader<'i> {
     names: SectionData<'i>,
     blocks: BlockIndex<'i>,
     cache: crate::cache::BlockCache,
+    metrics: crate::metrics::Metrics,
     #[cfg(feature = "zstd")]
     dictionary: Option<zstd::dict::DecoderDictionary<'static>>,
 }
@@ -642,6 +640,44 @@ impl<'i> Reader<'i> {
         Ok((e.stream_offset + within, e.length as u64 - within))
     }
 
+    /// Counters describing where read time went.
+    ///
+    /// These stay at zero unless the crate is built with the `metrics`
+    /// feature; the instrumentation compiles away otherwise.
+    pub fn metrics(&self) -> &crate::metrics::Metrics {
+        &self.metrics
+    }
+
+    #[inline]
+    fn note(&self, _pick: fn(&crate::metrics::Metrics) -> &std::sync::atomic::AtomicU64) {
+        #[cfg(feature = "metrics")]
+        self.metrics.bump(_pick(&self.metrics));
+    }
+
+    #[inline]
+    fn note_n(
+        &self,
+        _pick: fn(&crate::metrics::Metrics) -> &std::sync::atomic::AtomicU64,
+        _n: u64,
+    ) {
+        #[cfg(feature = "metrics")]
+        self.metrics.add(_pick(&self.metrics), _n);
+    }
+
+    #[inline]
+    fn phase<T>(
+        &self,
+        _pick: fn(&crate::metrics::Metrics) -> &std::sync::atomic::AtomicU64,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        #[cfg(feature = "metrics")]
+        {
+            self.metrics.timed(_pick(&self.metrics), f)
+        }
+        #[cfg(not(feature = "metrics"))]
+        f()
+    }
+
     /// Bytes this reader's cache currently holds.
     pub fn cache_used(&self) -> usize {
         self.cache.used()
@@ -654,14 +690,11 @@ impl<'i> Reader<'i> {
 
     /// The decoded bytes of one block.
     fn block(&self, index: u32) -> Result<Block<'_>> {
+        self.note(|m| &m.block_fetches);
         let e = self.blocks.get(index).ok_or(Error::Malformed {
             detail: "a stream offset falls outside the block index",
         })?;
         let stored_len = e.stored_length as u64;
-        let mut digest_bytes = [0u8; 8];
-        self.region
-            .read_at(e.image_offset + stored_len, &mut digest_bytes)?;
-        let want = u64::from_le_bytes(digest_bytes);
 
         if e.codec == Codec::Stored {
             if e.stored_length != e.decoded_length {
@@ -669,25 +702,40 @@ impl<'i> Reader<'i> {
                     detail: "a stored block's stored and decoded lengths differ",
                 });
             }
-            if let Some(b) = self.region.slice(e.image_offset, stored_len) {
-                if digest(b) != want {
+            if let Some(all) = self.region.slice(e.image_offset, stored_len + 8) {
+                let (b, tail) = all.split_at(e.stored_length as usize);
+                let mut want = [0u8; 8];
+                want.copy_from_slice(tail);
+                if self.phase(|m| &m.digest_ns, || digest(b)) != u64::from_le_bytes(want) {
                     return Err(Error::ChecksumMismatch { what: "block" });
                 }
+                self.note(|m| &m.lent);
                 return Ok(Block::Lent(b));
             }
         }
 
         let region = self.region;
+        let before = self.cache.decodes();
         let bytes = self.cache.get_or_decode(index, move || {
-            let mut raw = vec![0u8; e.stored_length as usize];
-            region.read_at(e.image_offset, &mut raw)?;
-            if digest(&raw) != want {
+            // The digest sits immediately after the block, so one call fetches
+            // both. Reading it separately doubled the calls into the source.
+            let mut raw = vec![0u8; e.stored_length as usize + 8];
+            self.note(|m| &m.source_calls);
+            self.note_n(|m| &m.source_bytes, raw.len() as u64);
+            self.phase(
+                |m| &m.source_ns,
+                || region.read_at(e.image_offset, &mut raw),
+            )?;
+            let mut want = [0u8; 8];
+            want.copy_from_slice(&raw[e.stored_length as usize..]);
+            raw.truncate(e.stored_length as usize);
+            if self.phase(|m| &m.digest_ns, || digest(&raw)) != u64::from_le_bytes(want) {
                 return Err(Error::ChecksumMismatch { what: "block" });
             }
             let decoded = match e.codec {
                 Codec::Stored => raw,
                 #[cfg(feature = "zstd")]
-                Codec::Zstd => zstd::decode_all(&raw[..])?,
+                Codec::Zstd => self.phase(|m| &m.decode_ns, || zstd::decode_all(&raw[..]))?,
                 #[cfg(not(feature = "zstd"))]
                 Codec::Zstd => {
                     return Err(Error::UnsupportedCodec {
@@ -699,8 +747,14 @@ impl<'i> Reader<'i> {
                     let dict = self.dictionary.as_ref().ok_or(Error::Malformed {
                         detail: "a block uses the image dictionary but none is present",
                     })?;
-                    let mut d = zstd::bulk::Decompressor::with_prepared_dictionary(dict)?;
-                    d.decompress(&raw, e.decoded_length as usize)?
+                    let mut d = self.phase(
+                        |m| &m.dctx_ns,
+                        || zstd::bulk::Decompressor::with_prepared_dictionary(dict),
+                    )?;
+                    self.phase(
+                        |m| &m.decode_ns,
+                        || d.decompress(&raw, e.decoded_length as usize),
+                    )?
                 }
                 #[cfg(not(feature = "zstd"))]
                 Codec::ZstdDict => {
@@ -716,6 +770,11 @@ impl<'i> Reader<'i> {
             }
             Ok(decoded)
         })?;
+        if self.cache.decodes() == before {
+            self.note(|m| &m.cache_hits);
+        } else {
+            self.note(|m| &m.cache_misses);
+        }
         Ok(Block::Cached(bytes))
     }
 
@@ -739,10 +798,12 @@ impl<'i> Reader<'i> {
         let want = (inode.size - offset).min(buf.len() as u64) as usize;
         let block_size = self.superblock.block_size as u64;
 
+        self.note(|m| &m.reads);
         let mut done = 0usize;
         while done < want {
             let at = offset + done as u64;
-            let (stream_offset, extent_left) = self.locate(&inode, at)?;
+            let (stream_offset, extent_left) =
+                self.phase(|m| &m.resolve_ns, || self.locate(&inode, at))?;
             if stream_offset >= self.superblock.stream_length {
                 return Err(Error::Malformed {
                     detail: "an extent points past the end of the stream",
@@ -763,9 +824,13 @@ impl<'i> Reader<'i> {
                 });
             }
             let n = available.min(extent_left as usize).min(want - done);
-            buf[done..done + n].copy_from_slice(&bytes[within..within + n]);
+            self.phase(
+                |m| &m.copy_ns,
+                || buf[done..done + n].copy_from_slice(&bytes[within..within + n]),
+            );
             done += n;
         }
+        self.note_n(|m| &m.read_bytes, done as u64);
         Ok(done)
     }
 }
@@ -791,6 +856,7 @@ impl<'a> Image<'a> {
             names: self.section_data(SectionKind::Names)?,
             blocks: self.block_index()?,
             cache: crate::cache::BlockCache::new(budget),
+            metrics: crate::metrics::Metrics::default(),
             #[cfg(feature = "zstd")]
             dictionary: {
                 let d = self.section_data(SectionKind::Dictionaries)?;
@@ -937,7 +1003,9 @@ mod tests {
 
     #[test]
     fn rejects_a_block_size_outside_the_permitted_range() {
-        for bad in [0u32, 2048, 65535, MAX_BLOCK_SIZE * 2] {
+        // No power of two above MAX_BLOCK_SIZE fits in the field, so the
+        // rejected cases are zero, too small, and not a power of two.
+        for bad in [0u32, 2048, 65535, u32::MAX] {
             let mut b = fixture();
             b[32..36].copy_from_slice(&bad.to_le_bytes());
             seal(&mut b);
@@ -1212,7 +1280,7 @@ mod tests_support {
             let inodes: Vec<u8> = self.inodes.iter().flat_map(enc_inode).collect();
             let dirents: Vec<u8> = self.dirents.iter().flat_map(enc_dirent).collect();
             let extents: Vec<u8> = self.extents.iter().flat_map(enc_extent).collect();
-            let block_section_len = blocks.len() * 16;
+            let block_section_len = blocks.len() * BLOCK_ENTRY_SIZE;
 
             // An empty section is absent, so it occupies no space at all.
             let present: Vec<(SectionKind, Vec<u8>)> = [
@@ -1291,11 +1359,12 @@ mod tests_support {
     }
 
     pub fn block_entry(image_offset: u64, stored: u32, decoded: u32, codec: Codec) -> Vec<u8> {
-        let mut e = Vec::with_capacity(16);
+        let mut e = Vec::with_capacity(BLOCK_ENTRY_SIZE);
         e.extend_from_slice(&image_offset.to_le_bytes());
         e.extend_from_slice(&stored.to_le_bytes());
-        e.extend_from_slice(&decoded.to_le_bytes()[..3]);
+        e.extend_from_slice(&decoded.to_le_bytes());
         e.push(codec.id());
+        e.extend_from_slice(&[0u8; 3]);
         e
     }
 

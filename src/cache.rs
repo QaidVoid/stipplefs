@@ -5,6 +5,7 @@
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 struct Slot {
@@ -33,6 +34,7 @@ pub struct BlockCache {
     inner: Mutex<Inner>,
     changed: Condvar,
     budget: usize,
+    decodes: AtomicU64,
 }
 
 /// Clears the in-flight marker even if the decoder panics or returns early.
@@ -63,12 +65,19 @@ impl BlockCache {
             inner: Mutex::new(Inner::default()),
             changed: Condvar::new(),
             budget,
+            decodes: AtomicU64::new(0),
         }
     }
 
     /// Bytes this cache is permitted to hold.
     pub fn budget(&self) -> usize {
         self.budget
+    }
+
+    /// How many blocks this cache has decoded, so a caller can tell a hit
+    /// from a miss without the cache knowing what a metric is.
+    pub fn decodes(&self) -> u64 {
+        self.decodes.load(Ordering::Relaxed)
     }
 
     /// Bytes currently held.
@@ -118,6 +127,7 @@ impl BlockCache {
             index,
             done: false,
         };
+        self.decodes.fetch_add(1, Ordering::Relaxed);
         let decoded = decode()?;
         let bytes: Arc<[u8]> = Arc::from(decoded);
 

@@ -6,9 +6,9 @@
 use crate::chunk::{ChunkerConfig, chunks};
 use crate::error::{Error, Result};
 use crate::format::{
-    ALIGNMENT, Codec, DIRENT_SIZE, EXTENT_SIZE, INODE_SIZE, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE,
-    S_IFDIR, S_IFLNK, S_IFREG, SECTION_COUNT, SUPERBLOCK_SIZE, SectionKind, Superblock,
-    VERSION_MAJOR, VERSION_MINOR,
+    ALIGNMENT, BLOCK_ENTRY_SIZE, Codec, DIRENT_SIZE, EXTENT_SIZE, INODE_SIZE, MAGIC,
+    MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, S_IFDIR, S_IFLNK, S_IFREG, SECTION_COUNT, SUPERBLOCK_SIZE,
+    SectionKind, Superblock, VERSION_MAJOR, VERSION_MINOR,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -509,7 +509,7 @@ impl Builder {
         let raw_blocks: Vec<&[u8]> = plan.stream.chunks(block_size).collect();
         let dictionary = self.train_dictionary(&raw_blocks);
         let encoded = self.encode_blocks(&raw_blocks, dictionary.as_deref());
-        let block_section_len = encoded.len() * 16;
+        let block_section_len = encoded.len() * BLOCK_ENTRY_SIZE;
 
         let mut sections: Vec<(SectionKind, Vec<u8>)> = Vec::new();
         for (kind, content) in [
@@ -543,8 +543,9 @@ impl Builder {
             codec_mask |= codec.bit();
             block_index.extend_from_slice(&at.to_le_bytes());
             block_index.extend_from_slice(&(enc.len() as u32).to_le_bytes());
-            block_index.extend_from_slice(&(raw.len() as u32).to_le_bytes()[..3]);
+            block_index.extend_from_slice(&(raw.len() as u32).to_le_bytes());
             block_index.push(codec.id());
+            block_index.extend_from_slice(&[0u8; 3]);
             at += enc.len() as u64 + 8;
         }
         if block_section_len > 0 {

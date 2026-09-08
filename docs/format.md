@@ -77,8 +77,7 @@ A reader SHALL reject the image unless all of the following hold:
 3. `checksum` matches the computed digest.
 4. `image_length` is a multiple of 4096 and does not exceed the range the
    caller supplied.
-5. `block_size` is a power of two, at least 4096 and at most 2^23. The
-   upper bound is set by `decoded_length` being three bytes.
+5. `block_size` is a power of two, at least 4096 and at most 2^31.
 6. Every present section lies entirely within `[4096, image_length)`.
 7. No two present sections overlap.
 8. Every bit set in `codec_mask` names a codec the reader implements.
@@ -100,17 +99,20 @@ that does not implement `zstd` may still open an image whose `codec_mask` is
 
 ## Block index
 
-`block_count` entries of 16 bytes each, in ascending order of `stream_offset`.
+`block_count` entries of 20 bytes each, in ascending order of `stream_offset`.
 
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | `image_offset`, where the stored bytes begin |
 | 8 | 4 | `stored_length`, bytes as stored |
-| 12 | 3 | `decoded_length`, bytes after decoding |
-| 15 | 1 | `codec` |
+| 12 | 4 | `decoded_length`, bytes after decoding |
+| 16 | 1 | `codec` |
+| 17 | 3 | reserved |
 
 Block `i` covers logical stream range `[i * block_size, i * block_size +
-decoded_length)`. Because blocks are laid out in stream order at a fixed
+decoded_length)`. The format places no useful ceiling on `block_size`: large
+blocks compress better and cost more to read, and choosing where to sit on that
+curve is the writer's business, not the format's. Because blocks are laid out in stream order at a fixed
 `block_size`, the block holding a stream offset is `offset / block_size`, an
 index rather than a search. Only the final block may have `decoded_length`
 less than `block_size`.

@@ -21,9 +21,12 @@ pub const SECTION_COUNT: usize = 6;
 /// Smallest permitted decoded block size.
 pub const MIN_BLOCK_SIZE: u32 = 4096;
 
-/// Largest permitted decoded block size, bounded by the three-byte
-/// `decoded_length` field of a block index entry.
-pub const MAX_BLOCK_SIZE: u32 = 1 << 23;
+/// Largest permitted decoded block size.
+///
+/// Large blocks compress better and cost more to read: serving one byte
+/// decodes the whole block. The format does not pick a point on that curve,
+/// it only bounds the field, so a writer may trade all the way to either end.
+pub const MAX_BLOCK_SIZE: u32 = 1 << 31;
 
 /// Index of each section within the section table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +152,9 @@ impl Superblock {
         self.sections[kind as usize]
     }
 }
+
+/// Size of one block index entry.
+pub const BLOCK_ENTRY_SIZE: usize = 20;
 
 /// Size of one inode table entry.
 pub const INODE_SIZE: usize = 40;

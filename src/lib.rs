@@ -27,3 +27,5 @@ pub mod write;
 
 #[cfg(feature = "mount")]
 pub mod mount;
+
+pub mod metrics;

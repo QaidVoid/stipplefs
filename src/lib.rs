@@ -11,6 +11,9 @@ pub mod error;
 pub mod format;
 
 #[cfg(feature = "read")]
+pub mod cache;
+
+#[cfg(feature = "read")]
 pub mod read;
 
 #[cfg(feature = "read")]

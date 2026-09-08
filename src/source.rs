@@ -6,7 +6,7 @@
 use crate::error::{Error, Result};
 
 /// A source of bytes that an image can be read from.
-pub trait ByteSource {
+pub trait ByteSource: Send + Sync {
     /// Total number of bytes available from this source.
     fn size(&self) -> u64;
 

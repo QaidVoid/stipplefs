@@ -325,6 +325,38 @@ impl<'a> Image<'a> {
     }
 }
 
+/// Default bytes of decoded blocks a reader may retain.
+///
+/// A budget below the working set is a performance cliff rather than a gentle
+/// slowdown: a walk in path order will evict and re-decode continuously. The
+/// default holds a few hundred blocks at the default block size, which does
+/// not thrash a typical tree. Raise it for large working sets, lower it only
+/// when memory is scarcer than time.
+pub const DEFAULT_CACHE_BUDGET: usize = 32 << 20;
+
+/// The decoded bytes of a block.
+///
+/// Blocks that the source can lend and that need no decoding are borrowed
+/// directly and cost no cache memory at all. Everything else is materialised
+/// and retained within the budget.
+pub enum Block<'a> {
+    /// Borrowed from the byte source, costing no cache memory.
+    Lent(&'a [u8]),
+    /// Materialised and held by the cache.
+    Cached(std::sync::Arc<[u8]>),
+}
+
+impl std::ops::Deref for Block<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Block::Lent(b) => b,
+            Block::Cached(b) => b,
+        }
+    }
+}
+
 /// A borrowing view over an image's metadata, built once and reused.
 ///
 /// Every section is verified when the reader is created, so later reads do
@@ -337,6 +369,7 @@ pub struct Reader<'i> {
     dirents: SectionData<'i>,
     names: SectionData<'i>,
     blocks: BlockIndex<'i>,
+    cache: crate::cache::BlockCache,
 }
 
 // Counts extent table probes so tests can check that resolution does not scan
@@ -503,8 +536,18 @@ impl<'i> Reader<'i> {
         Ok((e.stream_offset + within, e.length as u64 - within))
     }
 
-    /// The decoded bytes of one block, borrowed when the codec allows it.
-    fn block_bytes(&self, index: u32) -> Result<std::borrow::Cow<'_, [u8]>> {
+    /// Bytes this reader's cache currently holds.
+    pub fn cache_used(&self) -> usize {
+        self.cache.used()
+    }
+
+    /// Bytes this reader's cache is permitted to hold.
+    pub fn cache_budget(&self) -> usize {
+        self.cache.budget()
+    }
+
+    /// The decoded bytes of one block.
+    fn block(&self, index: u32) -> Result<Block<'_>> {
         let e = self.blocks.get(index).ok_or(Error::Malformed {
             detail: "a stream offset falls outside the block index",
         })?;
@@ -514,34 +557,35 @@ impl<'i> Reader<'i> {
             .read_at(e.image_offset + stored_len, &mut digest_bytes)?;
         let want = u64::from_le_bytes(digest_bytes);
 
-        match e.codec {
-            Codec::Stored => {
-                if e.stored_length != e.decoded_length {
-                    return Err(Error::Malformed {
-                        detail: "a stored block's stored and decoded lengths differ",
-                    });
-                }
-                match self.region.slice(e.image_offset, stored_len) {
-                    Some(b) => {
-                        if digest(b) != want {
-                            return Err(Error::ChecksumMismatch { what: "block" });
-                        }
-                        Ok(std::borrow::Cow::Borrowed(b))
-                    }
-                    None => {
-                        let mut b = vec![0u8; e.stored_length as usize];
-                        self.region.read_at(e.image_offset, &mut b)?;
-                        if digest(&b) != want {
-                            return Err(Error::ChecksumMismatch { what: "block" });
-                        }
-                        Ok(std::borrow::Cow::Owned(b))
-                    }
-                }
+        if e.codec == Codec::Stored {
+            if e.stored_length != e.decoded_length {
+                return Err(Error::Malformed {
+                    detail: "a stored block's stored and decoded lengths differ",
+                });
             }
-            Codec::Zstd | Codec::ZstdDict => Err(Error::UnsupportedCodec {
-                missing: e.codec.bit(),
-            }),
+            if let Some(b) = self.region.slice(e.image_offset, stored_len) {
+                if digest(b) != want {
+                    return Err(Error::ChecksumMismatch { what: "block" });
+                }
+                return Ok(Block::Lent(b));
+            }
         }
+
+        let region = self.region;
+        let bytes = self.cache.get_or_decode(index, move || {
+            let mut raw = vec![0u8; e.stored_length as usize];
+            region.read_at(e.image_offset, &mut raw)?;
+            if digest(&raw) != want {
+                return Err(Error::ChecksumMismatch { what: "block" });
+            }
+            match e.codec {
+                Codec::Stored => Ok(raw),
+                Codec::Zstd | Codec::ZstdDict => Err(Error::UnsupportedCodec {
+                    missing: e.codec.bit(),
+                }),
+            }
+        })?;
+        Ok(Block::Cached(bytes))
     }
 
     /// Read from a regular file into `buf`, returning how many bytes were read.
@@ -578,7 +622,7 @@ impl<'i> Reader<'i> {
                     detail: "a stream offset falls outside the block index",
                 })?;
             let within = (stream_offset % block_size) as usize;
-            let bytes = self.block_bytes(block_index)?;
+            let bytes = self.block(block_index)?;
             let available = bytes.len().checked_sub(within).ok_or(Error::Malformed {
                 detail: "an extent points past the end of its block",
             })?;
@@ -596,8 +640,17 @@ impl<'i> Reader<'i> {
 }
 
 impl<'a> Image<'a> {
-    /// Build a reader, verifying every metadata section once.
+    /// Build a reader with the default cache budget.
     pub fn reader(&self) -> Result<Reader<'_>> {
+        self.reader_with_budget(DEFAULT_CACHE_BUDGET)
+    }
+
+    /// Build a reader whose decoded-block cache holds at most `budget` bytes.
+    ///
+    /// Verifies every metadata section once, so later reads do not re-check
+    /// digests.
+    pub fn reader_with_budget(&self, budget: usize) -> Result<Reader<'_>> {
+        crate::cache::check_budget(budget, self.superblock.block_size as usize)?;
         Ok(Reader {
             superblock: self.superblock,
             region: &self.region,
@@ -606,6 +659,7 @@ impl<'a> Image<'a> {
             dirents: self.section_data(SectionKind::Dirents)?,
             names: self.section_data(SectionKind::Names)?,
             blocks: self.block_index()?,
+            cache: crate::cache::BlockCache::new(budget),
         })
     }
 }
@@ -1439,7 +1493,7 @@ mod read_tests {
         (0..8192u32).map(|i| (i % 251) as u8).collect()
     }
 
-    fn fs() -> Fs {
+    pub fn fs() -> Fs {
         Fs {
             stream: stream(),
             block_size: 4096,
@@ -1723,5 +1777,59 @@ mod read_tests {
             resolution_only <= 2 * (n as f64).log2().ceil() as usize + 4,
             "resolution alone probed {resolution_only} extents for {n}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_integration_tests {
+    use super::read_tests::fs as small_fs;
+    use super::*;
+
+    #[test]
+    fn a_lendable_stored_image_costs_no_cache_memory() {
+        let image = small_fs().build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let mut buf = vec![0u8; 250];
+        r.read(2, 0, &mut buf).unwrap();
+        assert_eq!(
+            r.cache_used(),
+            0,
+            "a stored block from a lendable source must not be copied into the cache"
+        );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn a_file_backed_image_uses_the_cache_and_respects_the_budget() {
+        let image = small_fs().build();
+        let path = std::env::temp_dir().join("stipplefs-cache.img");
+        std::fs::write(&path, &image).unwrap();
+
+        let img = Image::open(&path).unwrap();
+        let r = img.reader_with_budget(8192).unwrap();
+        let mut buf = vec![0u8; 250];
+        assert_eq!(r.read(2, 0, &mut buf).unwrap(), 250);
+
+        let in_memory = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let rm = in_memory.reader().unwrap();
+        let mut want = vec![0u8; 250];
+        rm.read(2, 0, &mut want).unwrap();
+
+        assert_eq!(buf, want, "cached and lent paths must agree");
+        assert!(
+            r.cache_used() > 0,
+            "a file-backed read must populate the cache"
+        );
+        assert!(r.cache_used() <= r.cache_budget());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_budget_below_one_block_is_rejected() {
+        let image = small_fs().build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        assert!(img.reader_with_budget(64).is_err());
+        assert!(img.reader_with_budget(4096).is_ok());
     }
 }

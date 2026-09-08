@@ -24,6 +24,11 @@ pub struct Options {
     pub codecs: u16,
     /// Compression level, where the codec takes one.
     pub level: i32,
+    /// Largest dictionary the writer will train, in bytes. Zero disables
+    /// dictionary training.
+    pub dictionary_size: usize,
+    /// Worker threads used to compress blocks. Output does not depend on this.
+    pub threads: usize,
 }
 
 impl Default for Options {
@@ -31,8 +36,10 @@ impl Default for Options {
         Options {
             block_size: 65536,
             chunk_average: 65536,
-            codecs: Codec::Stored.bit() | Codec::Zstd.bit(),
+            codecs: Codec::Stored.bit() | Codec::Zstd.bit() | Codec::ZstdDict.bit(),
             level: 19,
+            dictionary_size: 112 * 1024,
+            threads: 1,
         }
     }
 }
@@ -383,7 +390,7 @@ impl Builder {
     /// Stored wins unless another permitted codec is strictly smaller, and
     /// among equally sized results the lowest codec identifier wins, so the
     /// choice is decided by content rather than by iteration order.
-    fn encode_block(&self, raw: &[u8]) -> (Codec, Vec<u8>) {
+    fn encode_block(&self, raw: &[u8], dict: Option<&[u8]>) -> (Codec, Vec<u8>) {
         #[allow(unused_mut)]
         let mut best = (Codec::Stored, raw.to_vec());
         #[cfg(feature = "zstd")]
@@ -393,7 +400,80 @@ impl Builder {
         {
             best = (Codec::Zstd, z);
         }
+        #[cfg(feature = "zstd")]
+        if self.options.codecs & Codec::ZstdDict.bit() != 0
+            && let Some(d) = dict
+            && let Ok(mut c) = zstd::bulk::Compressor::with_dictionary(self.options.level, d)
+            && let Ok(z) = c.compress(raw)
+            && z.len() < best.1.len()
+        {
+            best = (Codec::ZstdDict, z);
+        }
+        #[cfg(not(feature = "zstd"))]
+        let _ = dict;
         best
+    }
+
+    /// Compress every block, optionally across several threads.
+    ///
+    /// Each worker takes a contiguous run and results are reassembled in index
+    /// order, so the output does not depend on the thread count or on which
+    /// worker finishes first.
+    fn encode_blocks(&self, blocks: &[&[u8]], dict: Option<&[u8]>) -> Vec<(Codec, Vec<u8>)> {
+        let threads = self.options.threads.clamp(1, blocks.len().max(1));
+        if threads == 1 {
+            return blocks.iter().map(|b| self.encode_block(b, dict)).collect();
+        }
+        let per = blocks.len().div_ceil(threads);
+        let parts: Vec<&[&[u8]]> = blocks.chunks(per).collect();
+        let mut collected: Vec<Vec<(Codec, Vec<u8>)>> = Vec::with_capacity(parts.len());
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = parts
+                .iter()
+                .map(|part| {
+                    scope.spawn(move || {
+                        part.iter()
+                            .map(|b| self.encode_block(b, dict))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for h in handles {
+                match h.join() {
+                    Ok(v) => collected.push(v),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+        });
+        collected.into_iter().flatten().collect()
+    }
+
+    /// Train a dictionary from evenly spaced blocks.
+    ///
+    /// Samples are taken from an ordered sequence at a fixed stride and the
+    /// parameters are pinned, so training is a pure function of the content.
+    /// Selecting samples from a hash container here would reintroduce exactly
+    /// the non-determinism the rest of the writer avoids.
+    #[allow(unused_variables)]
+    fn train_dictionary(&self, blocks: &[&[u8]]) -> Option<Vec<u8>> {
+        #[cfg(feature = "dict")]
+        {
+            if self.options.dictionary_size == 0
+                || self.options.codecs & Codec::ZstdDict.bit() == 0
+                || blocks.len() < 8
+            {
+                return None;
+            }
+            const TARGET_SAMPLES: usize = 128;
+            let stride = blocks.len().div_ceil(TARGET_SAMPLES).max(1);
+            let samples: Vec<&[u8]> = blocks.iter().step_by(stride).copied().collect();
+            if samples.len() < 8 {
+                return None;
+            }
+            zstd::dict::from_samples(&samples, self.options.dictionary_size).ok()
+        }
+        #[cfg(not(feature = "dict"))]
+        None
     }
 
     fn emit(&self, plan: Plan) -> Result<Vec<u8>> {
@@ -427,8 +507,8 @@ impl Builder {
 
         let block_size = self.options.block_size as usize;
         let raw_blocks: Vec<&[u8]> = plan.stream.chunks(block_size).collect();
-        let encoded: Vec<(Codec, Vec<u8>)> =
-            raw_blocks.iter().map(|b| self.encode_block(b)).collect();
+        let dictionary = self.train_dictionary(&raw_blocks);
+        let encoded = self.encode_blocks(&raw_blocks, dictionary.as_deref());
         let block_section_len = encoded.len() * 16;
 
         let mut sections: Vec<(SectionKind, Vec<u8>)> = Vec::new();
@@ -442,6 +522,7 @@ impl Builder {
                 sections.push((kind, content));
             }
         }
+        let dict_len = dictionary.as_ref().map_or(0, |d| d.len());
 
         let padded = |n: usize| -> u64 { ((n as u64 + 8).div_ceil(ALIGNMENT)) * ALIGNMENT };
         let mut data_at = ALIGNMENT;
@@ -450,6 +531,9 @@ impl Builder {
         }
         if block_section_len > 0 {
             data_at += padded(block_section_len);
+        }
+        if dict_len > 0 {
+            data_at += padded(dict_len);
         }
 
         let mut block_index = Vec::with_capacity(block_section_len);
@@ -465,6 +549,9 @@ impl Builder {
         }
         if block_section_len > 0 {
             sections.push((SectionKind::Blocks, block_index));
+        }
+        if let Some(d) = dictionary {
+            sections.push((SectionKind::Dictionaries, d));
         }
 
         let mut body = Vec::new();

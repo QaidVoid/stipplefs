@@ -18,6 +18,7 @@ fs = []
 mount = ["read"]
 mmap = ["dep:memmap2", "fs", "read"]
 zstd = ["dep:zstd"]
+dict = ["zstd", "zstd/zdict_builder"]
 
 [[bin]]
 name = "stipple"
@@ -26,3 +27,6 @@ required-features = ["read", "cli"]
 [[bin]]
 name = "mkstipple"
 required-features = ["write", "cli"]
+
+[dev-dependencies]
+twox-hash = { version = "2.1.4", default-features = false, features = ["xxhash3_64"] }

@@ -262,3 +262,107 @@ fn a_bad_block_size_is_rejected() {
         .is_err()
     );
 }
+
+#[test]
+fn thread_count_does_not_change_the_output() {
+    let make = |threads: usize| {
+        let opts = Options {
+            threads,
+            block_size: 4096,
+            chunk_average: 4096,
+            ..Options::default()
+        };
+        let mut b = Builder::new(opts).unwrap();
+        for i in 0..40u32 {
+            let mut c = b"shared prefix that repeats a great deal. ".repeat(60);
+            c.extend_from_slice(format!("tail {i}").as_bytes());
+            c.extend_from_slice(&pattern(9000, i as u64 + 100));
+            b.insert(format!("f{i:03}.bin").as_bytes(), file(&c))
+                .unwrap();
+        }
+        b.build().unwrap()
+    };
+    let one = make(1);
+    for threads in [2usize, 3, 4, 8, 16] {
+        assert_eq!(make(threads), one, "output differs at {threads} threads");
+    }
+
+    let img = Image::new(one.clone(), 0, one.len() as u64).unwrap();
+    assert!(
+        img.block_index().unwrap().count() > 8,
+        "test needs many blocks"
+    );
+}
+
+#[cfg(feature = "dict")]
+#[test]
+fn a_trained_dictionary_is_used_and_round_trips() {
+    let build = |dictionary_size: usize| {
+        let opts = Options {
+            dictionary_size,
+            block_size: 4096,
+            chunk_average: 4096,
+            ..Options::default()
+        };
+        let mut b = Builder::new(opts).unwrap();
+        for i in 0..64u32 {
+            let mut c = b"a highly repetitive body shared across every file. ".repeat(40);
+            c.extend_from_slice(format!("unique tail number {i}\n").as_bytes());
+            b.insert(format!("f{i:03}.txt").as_bytes(), file(&c))
+                .unwrap();
+        }
+        b.build().unwrap()
+    };
+
+    let with_dict = build(112 * 1024);
+    let without = build(0);
+
+    let a = Image::new(with_dict.clone(), 0, with_dict.len() as u64).unwrap();
+    let b = Image::new(without.clone(), 0, without.len() as u64).unwrap();
+
+    assert_ne!(
+        a.superblock()
+            .section(stipplefs::format::SectionKind::Dictionaries)
+            .size,
+        0,
+        "a dictionary should have been trained and stored"
+    );
+    assert_eq!(
+        b.superblock()
+            .section(stipplefs::format::SectionKind::Dictionaries)
+            .size,
+        0,
+        "no dictionary was requested"
+    );
+    assert_ne!(a.superblock().codec_mask & Codec::ZstdDict.bit(), 0);
+
+    let ra = a.reader().unwrap();
+    let rb = b.reader().unwrap();
+    for i in 0..64u32 {
+        let name = format!("f{i:03}.txt");
+        let ia = lookup(&ra, 0, name.as_bytes()).unwrap();
+        let ib = lookup(&rb, 0, name.as_bytes()).unwrap();
+        assert_eq!(read_all(&ra, ia), read_all(&rb, ib), "{name} differs");
+    }
+}
+
+#[cfg(feature = "dict")]
+#[test]
+fn dictionary_training_is_reproducible() {
+    let build = || {
+        let opts = Options {
+            block_size: 4096,
+            chunk_average: 4096,
+            ..Options::default()
+        };
+        let mut b = Builder::new(opts).unwrap();
+        for i in 0..64u32 {
+            let mut c = b"repeated content for dictionary training. ".repeat(40);
+            c.extend_from_slice(format!("{i}\n").as_bytes());
+            b.insert(format!("f{i:03}.txt").as_bytes(), file(&c))
+                .unwrap();
+        }
+        b.build().unwrap()
+    };
+    assert_eq!(build(), build());
+}

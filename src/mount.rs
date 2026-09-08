@@ -1,15 +1,15 @@
 //! Exposing an image through FUSE.
 //!
-//! The mount is read only. Timestamps are reported as the Unix epoch, because
-//! the format records none; that is what keeps images byte-identical between
-//! builds.
+//! The mount is read only. An entry whose image records no modification time
+//! is reported as the Unix epoch, which is what an image built for
+//! reproducibility holds for every entry.
 
 use crate::format::{FileType as OurType, Inode};
 use crate::read::Reader;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, OpenFlags,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyWrite, Request,
+    ReplyWrite, ReplyXattr, Request,
 };
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -54,30 +54,57 @@ impl Mount {
         INodeNo(ino as u64 + 1)
     }
 
-    fn attr(&self, ino: u32, node: &Inode) -> FileAttr {
-        let kind = match node.file_type() {
+    /// The kernel's name for what an inode describes.
+    fn kind_of(node: &Inode) -> FileType {
+        match node.file_type() {
             Some(OurType::Directory) => FileType::Directory,
             Some(OurType::Symlink) => FileType::Symlink,
+            Some(OurType::Fifo) => FileType::NamedPipe,
+            Some(OurType::Socket) => FileType::Socket,
+            Some(OurType::CharDevice) => FileType::CharDevice,
+            Some(OurType::BlockDevice) => FileType::BlockDevice,
             _ => FileType::RegularFile,
-        };
+        }
+    }
+
+    /// Answer an extended attribute request.
+    ///
+    /// A caller asks with a size of zero to learn how much room it needs, then
+    /// asks again with a buffer that large.
+    fn reply_xattr(value: &[u8], size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(value.len() as u32);
+        } else if (size as usize) < value.len() {
+            reply.error(Errno::ERANGE);
+        } else {
+            reply.data(value);
+        }
+    }
+
+    fn attr(&self, ino: u32, node: &Inode) -> FileAttr {
+        let kind = Self::kind_of(node);
         let size = match node.file_type() {
             Some(OurType::Directory) => 0,
             _ => node.size,
         };
+        let mtime = node
+            .mtime
+            .and_then(|t| UNIX_EPOCH.checked_add(Duration::from_secs(t)))
+            .unwrap_or(UNIX_EPOCH);
         FileAttr {
             ino: Self::to_kernel(ino),
             size,
             blocks: size.div_ceil(512),
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            atime: mtime,
+            mtime,
+            ctime: mtime,
+            crtime: mtime,
             kind,
             perm: (node.mode & 0o7777) as u16,
             nlink: node.nlink,
             uid: node.uid,
             gid: node.gid,
-            rdev: 0,
+            rdev: node.device().unwrap_or(0) as u32,
             blksize: self.reader.superblock().block_size,
             flags: 0,
         }
@@ -194,11 +221,7 @@ impl Filesystem for Mount {
                         reply.error(Errno::EIO);
                         return;
                     };
-                    let kind = match node.file_type() {
-                        Some(OurType::Directory) => FileType::Directory,
-                        Some(OurType::Symlink) => FileType::Symlink,
-                        _ => FileType::RegularFile,
-                    };
+                    let kind = Self::kind_of(&node);
                     reply.add(
                         Self::to_kernel(entry.inode),
                         n + 1,
@@ -284,6 +307,55 @@ impl Filesystem for Mount {
         _target: &Path,
         reply: ReplyEntry,
     ) {
+        reply.error(Errno::EROFS);
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let Some(ino) = Self::to_image(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Ok(attrs) = self.reader.xattrs(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let mut names = Vec::new();
+        for (name, _) in attrs {
+            names.extend_from_slice(name);
+            names.push(0);
+        }
+        Self::reply_xattr(&names, size, reply);
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let Some(ino) = Self::to_image(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Ok(attrs) = self.reader.xattrs(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match attrs.iter().find(|(n, _)| *n == name.as_bytes()) {
+            Some((_, value)) => Self::reply_xattr(value, size, reply),
+            None => reply.error(Errno::ENODATA),
+        }
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::EROFS);
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
         reply.error(Errno::EROFS);
     }
 }

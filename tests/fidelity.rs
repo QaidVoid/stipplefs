@@ -513,3 +513,105 @@ fn inspecting_an_image_of_every_kind_counts_each_one() {
         "metadata cost per inode was reported as zero: {per_inode}"
     );
 }
+
+#[test]
+fn extracting_a_device_it_cannot_create_says_so_and_substitutes_nothing() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let s = Scratch::new("mknod");
+    let image = s.path("all.stipple");
+    std::fs::write(&image, every_kind_image()).unwrap();
+    let dest = s.path("out");
+
+    let out = Command::new(ST)
+        .arg("extract")
+        .arg(&image)
+        .arg(&dest)
+        .output()
+        .unwrap();
+
+    let chr = dest.join("chr");
+    if out.status.success() {
+        // Running with the privilege to make device nodes, so every kind
+        // should have been recreated as itself.
+        let meta = std::fs::symlink_metadata(&chr).unwrap();
+        assert!(
+            meta.file_type().is_char_device(),
+            "chr came back as something else"
+        );
+        let blk = std::fs::symlink_metadata(dest.join("blk")).unwrap();
+        assert!(
+            blk.file_type().is_block_device(),
+            "blk came back as something else"
+        );
+        return;
+    }
+
+    let message = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        message.contains("chr") || message.contains("blk"),
+        "the failure did not name the entry it could not create: {message}"
+    );
+    assert!(
+        message.contains("creating this entry failed"),
+        "the failure did not give a reason: {message}"
+    );
+    if let Ok(meta) = std::fs::symlink_metadata(&chr) {
+        assert!(
+            !meta.file_type().is_file(),
+            "a regular file was left where a device node belonged"
+        );
+    }
+}
+
+#[test]
+fn extraction_recreates_every_kind_it_is_allowed_to() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let s = Scratch::new("recreate");
+    let src = s.path("src");
+    let expected = build_fixture(&src);
+    let image = s.path("out.stipple");
+    let built = Command::new(MK)
+        .arg(&src)
+        .arg(&image)
+        .args(["--block-size", "4096", "--level", "3"])
+        .output()
+        .unwrap();
+    assert!(built.status.success());
+
+    let dest = s.path("out");
+    let out = Command::new(ST)
+        .arg("extract")
+        .arg(&image)
+        .arg(&dest)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for (rel, kind) in &expected {
+        let meta = std::fs::symlink_metadata(dest.join(rel))
+            .unwrap_or_else(|e| panic!("{rel} was not extracted: {e}"));
+        let t = meta.file_type();
+        let got = if t.is_dir() {
+            "dir"
+        } else if t.is_symlink() {
+            "symlink"
+        } else if t.is_fifo() {
+            "fifo"
+        } else if t.is_socket() {
+            "socket"
+        } else if t.is_char_device() {
+            "char"
+        } else if t.is_block_device() {
+            "block"
+        } else {
+            "file"
+        };
+        assert_eq!(got, kind, "{rel} came back as {got}");
+    }
+}

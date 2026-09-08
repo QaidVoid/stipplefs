@@ -240,3 +240,214 @@ fn concurrent_readers_all_see_correct_content() {
         }
     });
 }
+
+/// An image holding one of every kind the format defines, plus an extended
+/// attribute and a known modification time.
+fn every_kind_image() -> Vec<u8> {
+    use stipplefs::write::{Builder, DeviceKind, Node, Options, SpecialKind};
+
+    let mut b = Builder::new(Options {
+        block_size: 4096,
+        level: 3,
+        ..Options::default()
+    })
+    .unwrap();
+    b.insert(
+        b"hello.txt",
+        Node::File {
+            content: b"hello from stipplefs\n".to_vec(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            link_group: None,
+        },
+    )
+    .unwrap();
+    b.insert(
+        b"dir",
+        Node::Directory {
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        },
+    )
+    .unwrap();
+    b.insert(
+        b"link",
+        Node::Symlink {
+            target: b"hello.txt".to_vec(),
+            uid: 0,
+            gid: 0,
+        },
+    )
+    .unwrap();
+    b.insert(
+        b"pipe",
+        Node::Special {
+            kind: SpecialKind::Fifo,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+    )
+    .unwrap();
+    b.insert(
+        b"sock",
+        Node::Special {
+            kind: SpecialKind::Socket,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+    )
+    .unwrap();
+    b.insert(
+        b"chr",
+        Node::Device {
+            kind: DeviceKind::Char,
+            rdev: 0x0103,
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+        },
+    )
+    .unwrap();
+    b.insert(
+        b"blk",
+        Node::Device {
+            kind: DeviceKind::Block,
+            rdev: 0x0800,
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+        },
+    )
+    .unwrap();
+    b.set_xattrs(
+        b"hello.txt",
+        vec![(b"user.marker".to_vec(), b"kept".to_vec())],
+    );
+    b.set_mtime(b"hello.txt", 1_600_000_000);
+    b.build().unwrap()
+}
+
+#[test]
+fn the_mount_presents_every_kind_with_its_own_type() {
+    use std::os::unix::fs::FileTypeExt;
+
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let dir = scratch("kinds");
+    let image = dir.join("all.stipple");
+    std::fs::write(&image, every_kind_image()).unwrap();
+    let point = dir.join("mnt");
+    let Some(_m) = mount_image(&image, &point) else {
+        eprintln!("skipping: the image could not be mounted");
+        return;
+    };
+
+    let check = |name: &str, want: &str| {
+        let meta = std::fs::symlink_metadata(point.join(name)).unwrap();
+        let t = meta.file_type();
+        let got = if t.is_dir() {
+            "dir"
+        } else if t.is_symlink() {
+            "symlink"
+        } else if t.is_fifo() {
+            "fifo"
+        } else if t.is_socket() {
+            "socket"
+        } else if t.is_char_device() {
+            "char"
+        } else if t.is_block_device() {
+            "block"
+        } else {
+            "file"
+        };
+        assert_eq!(got, want, "{name} was presented as {got}");
+    };
+    check("hello.txt", "file");
+    check("dir", "dir");
+    check("link", "symlink");
+    check("pipe", "fifo");
+    check("sock", "socket");
+    check("chr", "char");
+    check("blk", "block");
+
+    use std::os::unix::fs::MetadataExt;
+    let chr = std::fs::symlink_metadata(point.join("chr")).unwrap();
+    assert_eq!(chr.rdev(), 0x0103, "the character device lost its number");
+    let blk = std::fs::symlink_metadata(point.join("blk")).unwrap();
+    assert_eq!(blk.rdev(), 0x0800, "the block device lost its number");
+}
+
+#[test]
+fn the_mount_reports_times_and_attributes_and_refuses_to_change_them() {
+    use std::os::unix::fs::MetadataExt;
+
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let dir = scratch("xattr");
+    let image = dir.join("all.stipple");
+    std::fs::write(&image, every_kind_image()).unwrap();
+    let point = dir.join("mnt");
+    let Some(_m) = mount_image(&image, &point) else {
+        eprintln!("skipping: the image could not be mounted");
+        return;
+    };
+    let file = point.join("hello.txt");
+
+    let meta = std::fs::symlink_metadata(&file).unwrap();
+    assert_eq!(
+        meta.mtime(),
+        1_600_000_000,
+        "the mount reported a different modification time"
+    );
+
+    if have("getfattr") {
+        let out = Command::new("getfattr")
+            .args(["-n", "user.marker", "--only-values"])
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "reading the attribute failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "kept",
+            "the mount reported a different attribute value"
+        );
+    }
+    if have("setfattr") {
+        let out = Command::new("setfattr")
+            .args(["-n", "user.marker", "-v", "changed"])
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "the mount allowed an attribute to be changed"
+        );
+        let message = String::from_utf8_lossy(&out.stderr).to_lowercase();
+        assert!(
+            message.contains("read-only") || message.contains("read only"),
+            "changing an attribute failed for the wrong reason: {message}"
+        );
+    }
+}
+
+fn have(tool: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {tool}"))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}

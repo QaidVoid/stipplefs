@@ -814,3 +814,213 @@ mod section_tests {
         ));
     }
 }
+
+#[cfg(all(test, feature = "mmap"))]
+mod mmap_tests {
+    use super::tests_support::{Builder, block_entry};
+    use super::*;
+    use crate::source::MmapSource;
+
+    #[test]
+    fn a_mapped_image_lends_its_metadata() {
+        let probe = Builder::default().section(SectionKind::Blocks, vec![0u8; 16]);
+        let at = probe.data_offset();
+        let image = Builder::default()
+            .section(
+                SectionKind::Blocks,
+                block_entry(at, 100, 4096, Codec::Stored),
+            )
+            .block_count(1)
+            .with_data(vec![0xEE; 200])
+            .build();
+
+        let path = std::env::temp_dir().join("stipplefs-mmap.img");
+        std::fs::write(&path, &image).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        // SAFETY: the file is written once above and not touched again while mapped.
+        let source = unsafe { MmapSource::new(&file) }.unwrap();
+        let mapped = Image::new(source, 0, image.len() as u64).unwrap();
+
+        let data = mapped.section_data(SectionKind::Blocks).unwrap();
+        assert!(
+            matches!(data, std::borrow::Cow::Borrowed(_)),
+            "a mapped image must lend metadata rather than copy it"
+        );
+
+        let in_memory = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        assert_eq!(
+            mapped.block_index().unwrap().get(0),
+            in_memory.block_index().unwrap().get(0)
+        );
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+    use super::tests_support::{Builder, block_entry};
+    use super::*;
+
+    /// Deterministic generator, so a failing case is reproducible from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            if n == 0 {
+                0
+            } else {
+                (self.next() % n as u64) as usize
+            }
+        }
+    }
+
+    fn sound_image() -> Vec<u8> {
+        let probe = Builder::default().section(SectionKind::Blocks, vec![0u8; 32]);
+        let at = probe.data_offset();
+        let mut blocks = block_entry(at, 100, 4096, Codec::Stored);
+        blocks.extend(block_entry(at + 108, 50, 4096, Codec::Stored));
+        Builder::default()
+            .section(SectionKind::Blocks, blocks)
+            .section(SectionKind::Inodes, vec![7u8; 120])
+            .block_count(2)
+            .with_data(vec![0xEE; 300])
+            .build()
+    }
+
+    /// Exercises every public entry point. Any outcome is acceptable except a
+    /// panic, an out-of-range read, or a hang.
+    fn poke(bytes: &[u8]) {
+        let len = bytes.len() as u64;
+        if let Ok(image) = Image::new(bytes.to_vec(), 0, len) {
+            let _ = image.section_data(SectionKind::Blocks);
+            let _ = image.section_data(SectionKind::Inodes);
+            let _ = image.section_data(SectionKind::Names);
+            if let Ok(index) = image.block_index() {
+                for i in 0..index.count().min(1000) {
+                    let _ = index.get(i);
+                }
+                let _ = index.get(u32::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        let mut rng = Rng(0x5754_4950_504C_4501);
+        for _ in 0..4000 {
+            let n = rng.below(9000);
+            let bytes: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+            poke(&bytes);
+        }
+    }
+
+    #[test]
+    fn corrupted_images_never_panic() {
+        let sound = sound_image();
+        let mut rng = Rng(0x0BAD_C0DE_1234_5678);
+        for _ in 0..20_000 {
+            let mut bytes = sound.clone();
+            for _ in 0..1 + rng.below(6) {
+                let at = rng.below(bytes.len());
+                match rng.below(3) {
+                    0 => bytes[at] ^= 1 << rng.below(8),
+                    1 => bytes[at] = rng.next() as u8,
+                    _ => bytes[at] = 0xff,
+                }
+            }
+            poke(&bytes);
+        }
+    }
+
+    #[test]
+    fn truncated_images_never_panic() {
+        let sound = sound_image();
+        for n in 0..sound.len().min(9000) {
+            poke(&sound[..n]);
+        }
+        let mut rng = Rng(0x7EAD_BEEF_0000_0001);
+        for _ in 0..2000 {
+            let n = rng.below(sound.len());
+            poke(&sound[..n]);
+        }
+    }
+
+    /// Recomputes every digest so a mutation reaches the validation logic
+    /// instead of being stopped at an integrity check. Without this, checksums
+    /// shield exactly the fields whose validation most needs exercising.
+    fn reseal(bytes: &mut [u8]) {
+        if bytes.len() < SUPERBLOCK_SIZE {
+            return;
+        }
+        for i in 0..SECTION_COUNT {
+            let base = 56 + i * 16;
+            let mut o = [0u8; 8];
+            let mut z = [0u8; 8];
+            o.copy_from_slice(&bytes[base..base + 8]);
+            z.copy_from_slice(&bytes[base + 8..base + 16]);
+            let (off, size) = (u64::from_le_bytes(o), u64::from_le_bytes(z));
+            if size < 8 {
+                continue;
+            }
+            let (Ok(start), Ok(end)) = (usize::try_from(off), usize::try_from(off + size)) else {
+                continue;
+            };
+            if end > bytes.len() || start < SUPERBLOCK_SIZE {
+                continue;
+            }
+            let d = digest(&bytes[start..end - 8]).to_le_bytes();
+            bytes[end - 8..end].copy_from_slice(&d);
+        }
+        let d = digest(&bytes[..Superblock::CHECKSUM_OFFSET]).to_le_bytes();
+        bytes[Superblock::CHECKSUM_OFFSET..SUPERBLOCK_SIZE].copy_from_slice(&d);
+    }
+
+    #[test]
+    fn resealed_corruption_never_panics() {
+        let sound = sound_image();
+        let mut rng = Rng(0xFEED_FACE_DEAD_BEEF);
+        for _ in 0..20_000 {
+            let mut bytes = sound.clone();
+            for _ in 0..1 + rng.below(5) {
+                let at = rng.below(bytes.len());
+                match rng.below(4) {
+                    0 => bytes[at] ^= 1 << rng.below(8),
+                    1 => bytes[at] = rng.next() as u8,
+                    2 => bytes[at] = 0xff,
+                    _ => bytes[at] = 0,
+                }
+            }
+            reseal(&mut bytes);
+            poke(&bytes);
+        }
+    }
+
+    #[test]
+    fn resealed_truncation_never_panics() {
+        let sound = sound_image();
+        let mut rng = Rng(0xC0FF_EE00_1111_2222);
+        for _ in 0..3000 {
+            let n = rng.below(sound.len());
+            let mut bytes = sound[..n].to_vec();
+            reseal(&mut bytes);
+            poke(&bytes);
+        }
+    }
+
+    #[test]
+    fn a_sound_image_still_reads_after_all_that() {
+        let sound = sound_image();
+        let image = Image::new(sound.clone(), 0, sound.len() as u64).unwrap();
+        assert_eq!(image.block_index().unwrap().count(), 2);
+    }
+}

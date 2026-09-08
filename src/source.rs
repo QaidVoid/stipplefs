@@ -186,6 +186,47 @@ impl ByteSource for FileSource {
     }
 }
 
+/// A byte source backed by a memory mapping of a file.
+///
+/// This is the only file-backed source that can lend its bytes, so metadata
+/// read through it is searched in place rather than copied into the process.
+#[cfg(feature = "mmap")]
+pub struct MmapSource {
+    map: memmap2::Mmap,
+}
+
+#[cfg(feature = "mmap")]
+impl MmapSource {
+    /// Map the whole of `file`.
+    ///
+    /// # Safety
+    ///
+    /// The mapped file must not be modified or truncated by any process for
+    /// as long as the returned source lives. Reading a mapping whose backing
+    /// file has shrunk raises `SIGBUS`, which cannot be caught. This hazard
+    /// is inherent to memory mapping rather than specific to this crate,
+    /// which is why the safe constructors copy instead.
+    pub unsafe fn new(file: &std::fs::File) -> Result<Self> {
+        let map = unsafe { memmap2::Mmap::map(file)? };
+        Ok(MmapSource { map })
+    }
+}
+
+#[cfg(feature = "mmap")]
+impl ByteSource for MmapSource {
+    fn size(&self) -> u64 {
+        self.map.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        slice_read(&self.map, offset, buf)
+    }
+
+    fn as_slice(&self) -> Option<&[u8]> {
+        Some(&self.map)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

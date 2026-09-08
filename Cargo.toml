@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+memmap2 = { version = "0.9.11", optional = true }
 twox-hash = { version = "2.1.4", default-features = false, optional = true }
 
 [features]
@@ -14,6 +15,7 @@ write = ["dep:twox-hash", "twox-hash/xxhash3_64", "twox-hash/xxhash3_128"]
 cli = []
 fs = []
 mount = ["read"]
+mmap = ["dep:memmap2", "fs", "read"]
 
 [[bin]]
 name = "stipple"

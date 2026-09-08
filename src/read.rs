@@ -2,8 +2,9 @@
 
 use crate::error::{Error, Result};
 use crate::format::{
-    ALIGNMENT, Codec, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, SECTION_COUNT, SUPERBLOCK_SIZE,
-    Section, SectionKind, Superblock, VERSION_MAJOR, supported_codecs,
+    ALIGNMENT, Codec, DIRENT_SIZE, Dirent, EXTENT_SIZE, Extent, FileType, INODE_SIZE, Inode, MAGIC,
+    MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, SECTION_COUNT, SUPERBLOCK_SIZE, Section, SectionKind,
+    Superblock, VERSION_MAJOR, supported_codecs,
 };
 use crate::source::{ByteSource, Region};
 
@@ -324,6 +325,291 @@ impl<'a> Image<'a> {
     }
 }
 
+/// A borrowing view over an image's metadata, built once and reused.
+///
+/// Every section is verified when the reader is created, so later reads do
+/// not re-check digests.
+pub struct Reader<'i> {
+    superblock: Superblock,
+    region: &'i Region<'i>,
+    inodes: SectionData<'i>,
+    extents: SectionData<'i>,
+    dirents: SectionData<'i>,
+    names: SectionData<'i>,
+    blocks: BlockIndex<'i>,
+}
+
+// Counts extent table probes so tests can check that resolution does not scan
+// a file's extents. Thread local because the harness runs tests in parallel and
+// a shared counter would be inflated by whatever else is running.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EXTENT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn le_u16(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
+
+fn le_u32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+fn le_u64(b: &[u8]) -> u64 {
+    let mut v = [0u8; 8];
+    v.copy_from_slice(&b[..8]);
+    u64::from_le_bytes(v)
+}
+
+impl<'i> Reader<'i> {
+    /// The image's superblock.
+    pub fn superblock(&self) -> &Superblock {
+        &self.superblock
+    }
+
+    /// The block index.
+    pub fn blocks(&self) -> &BlockIndex<'i> {
+        &self.blocks
+    }
+
+    /// Inode `ino`, or `None` when it does not exist.
+    pub fn inode(&self, ino: u32) -> Option<Inode> {
+        if ino >= self.superblock.inode_count {
+            return None;
+        }
+        let at = ino as usize * INODE_SIZE;
+        let e = self.inodes.get(at..at + INODE_SIZE)?;
+        Some(Inode {
+            size: le_u64(&e[0..8]),
+            payload: le_u64(&e[8..16]),
+            extent_count: le_u32(&e[16..20]),
+            mode: le_u32(&e[20..24]),
+            uid: le_u32(&e[24..28]),
+            gid: le_u32(&e[28..32]),
+            nlink: le_u32(&e[32..36]),
+        })
+    }
+
+    /// Extent table entry `i`.
+    pub fn extent(&self, i: u32) -> Option<Extent> {
+        #[cfg(test)]
+        EXTENT_PROBES.with(|c| c.set(c.get() + 1));
+        if i >= self.superblock.extent_count {
+            return None;
+        }
+        let at = i as usize * EXTENT_SIZE;
+        let e = self.extents.get(at..at + EXTENT_SIZE)?;
+        Some(Extent {
+            stream_offset: le_u64(&e[0..8]),
+            file_offset: le_u64(&e[8..16]),
+            length: le_u32(&e[16..20]),
+        })
+    }
+
+    /// Directory entry `i`.
+    pub fn dirent(&self, i: u32) -> Option<Dirent> {
+        let at = i as usize * DIRENT_SIZE;
+        let e = self.dirents.get(at..at + DIRENT_SIZE)?;
+        Some(Dirent {
+            inode: le_u32(&e[0..4]),
+            name_offset: le_u32(&e[4..8]),
+            name_length: le_u16(&e[8..10]),
+        })
+    }
+
+    /// The bytes of a directory entry's name.
+    pub fn name(&self, entry: Dirent) -> Option<&[u8]> {
+        let at = entry.name_offset as usize;
+        self.names.get(at..at + entry.name_length as usize)
+    }
+
+    /// Check that a regular file's extents tile it exactly.
+    fn check_tiling(&self, inode: &Inode) -> Result<()> {
+        if inode.extent_count == 0 {
+            return if inode.size == 0 {
+                Ok(())
+            } else {
+                Err(Error::Malformed {
+                    detail: "a file with no extents has a non-zero size",
+                })
+            };
+        }
+        if inode.extent_count == 1 {
+            return Ok(());
+        }
+        let first = u32::try_from(inode.payload).map_err(|_| Error::Malformed {
+            detail: "a file's first extent index does not fit the extent table",
+        })?;
+        let last = first
+            .checked_add(inode.extent_count)
+            .ok_or(Error::Malformed {
+                detail: "a file's extent run overflows the extent table",
+            })?;
+        if last > self.superblock.extent_count {
+            return Err(Error::Malformed {
+                detail: "a file's extent run runs past the end of the extent table",
+            });
+        }
+        let mut expected = 0u64;
+        for i in first..last {
+            let e = self.extent(i).ok_or(Error::Malformed {
+                detail: "a file references an extent that cannot be read",
+            })?;
+            if e.file_offset != expected {
+                return Err(Error::Malformed {
+                    detail: "a file's extents leave a gap or overlap",
+                });
+            }
+            expected = expected
+                .checked_add(e.length as u64)
+                .ok_or(Error::Malformed {
+                    detail: "a file's extent lengths overflow",
+                })?;
+        }
+        if expected != inode.size {
+            return Err(Error::Malformed {
+                detail: "a file's extent lengths do not sum to its recorded size",
+            });
+        }
+        Ok(())
+    }
+
+    /// Find the extent covering `offset`, returning it and how many of its
+    /// bytes remain from that point.
+    fn locate(&self, inode: &Inode, offset: u64) -> Result<(u64, u64)> {
+        if inode.extent_count == 1 {
+            let remaining = inode.size - offset;
+            return Ok((inode.payload + offset, remaining));
+        }
+        let first = inode.payload as u32;
+        let count = inode.extent_count;
+        let mut lo = 0u32;
+        let mut hi = count;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            let e = self.extent(first + mid).ok_or(Error::Malformed {
+                detail: "a file references an extent that cannot be read",
+            })?;
+            if e.file_offset <= offset {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let e = self.extent(first + lo).ok_or(Error::Malformed {
+            detail: "a file references an extent that cannot be read",
+        })?;
+        let within = offset - e.file_offset;
+        Ok((e.stream_offset + within, e.length as u64 - within))
+    }
+
+    /// The decoded bytes of one block, borrowed when the codec allows it.
+    fn block_bytes(&self, index: u32) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let e = self.blocks.get(index).ok_or(Error::Malformed {
+            detail: "a stream offset falls outside the block index",
+        })?;
+        let stored_len = e.stored_length as u64;
+        let mut digest_bytes = [0u8; 8];
+        self.region
+            .read_at(e.image_offset + stored_len, &mut digest_bytes)?;
+        let want = u64::from_le_bytes(digest_bytes);
+
+        match e.codec {
+            Codec::Stored => {
+                if e.stored_length != e.decoded_length {
+                    return Err(Error::Malformed {
+                        detail: "a stored block's stored and decoded lengths differ",
+                    });
+                }
+                match self.region.slice(e.image_offset, stored_len) {
+                    Some(b) => {
+                        if digest(b) != want {
+                            return Err(Error::ChecksumMismatch { what: "block" });
+                        }
+                        Ok(std::borrow::Cow::Borrowed(b))
+                    }
+                    None => {
+                        let mut b = vec![0u8; e.stored_length as usize];
+                        self.region.read_at(e.image_offset, &mut b)?;
+                        if digest(&b) != want {
+                            return Err(Error::ChecksumMismatch { what: "block" });
+                        }
+                        Ok(std::borrow::Cow::Owned(b))
+                    }
+                }
+            }
+            Codec::Zstd | Codec::ZstdDict => Err(Error::UnsupportedCodec {
+                missing: e.codec.bit(),
+            }),
+        }
+    }
+
+    /// Read from a regular file into `buf`, returning how many bytes were read.
+    ///
+    /// A read starting inside the file and extending past its end returns the
+    /// bytes that exist. A read starting at or after the end returns zero.
+    pub fn read(&self, ino: u32, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let inode = self.inode(ino).ok_or(Error::Malformed {
+            detail: "read of an inode that does not exist",
+        })?;
+        if inode.file_type() != Some(FileType::Regular) {
+            return Err(Error::Malformed {
+                detail: "read of something that is not a regular file",
+            });
+        }
+        self.check_tiling(&inode)?;
+        if offset >= inode.size {
+            return Ok(0);
+        }
+        let want = (inode.size - offset).min(buf.len() as u64) as usize;
+        let block_size = self.superblock.block_size as u64;
+
+        let mut done = 0usize;
+        while done < want {
+            let at = offset + done as u64;
+            let (stream_offset, extent_left) = self.locate(&inode, at)?;
+            if stream_offset >= self.superblock.stream_length {
+                return Err(Error::Malformed {
+                    detail: "an extent points past the end of the stream",
+                });
+            }
+            let block_index =
+                u32::try_from(stream_offset / block_size).map_err(|_| Error::Malformed {
+                    detail: "a stream offset falls outside the block index",
+                })?;
+            let within = (stream_offset % block_size) as usize;
+            let bytes = self.block_bytes(block_index)?;
+            let available = bytes.len().checked_sub(within).ok_or(Error::Malformed {
+                detail: "an extent points past the end of its block",
+            })?;
+            if available == 0 {
+                return Err(Error::Malformed {
+                    detail: "an extent points at the end of its block",
+                });
+            }
+            let n = available.min(extent_left as usize).min(want - done);
+            buf[done..done + n].copy_from_slice(&bytes[within..within + n]);
+            done += n;
+        }
+        Ok(done)
+    }
+}
+
+impl<'a> Image<'a> {
+    /// Build a reader, verifying every metadata section once.
+    pub fn reader(&self) -> Result<Reader<'_>> {
+        Ok(Reader {
+            superblock: self.superblock,
+            region: &self.region,
+            inodes: self.section_data(SectionKind::Inodes)?,
+            extents: self.section_data(SectionKind::Extents)?,
+            dirents: self.section_data(SectionKind::Dirents)?,
+            names: self.section_data(SectionKind::Names)?,
+            blocks: self.block_index()?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,6 +866,9 @@ mod tests_support {
         pub codec_mask: u16,
         pub block_size: u32,
         pub data: Vec<u8>,
+        pub stream_length: u64,
+        pub inode_count: u32,
+        pub extent_count: u32,
     }
 
     impl Default for Builder {
@@ -590,6 +879,9 @@ mod tests_support {
                 codec_mask: Codec::Stored.bit(),
                 block_size: 65536,
                 data: Vec::new(),
+                stream_length: 0,
+                inode_count: 0,
+                extent_count: 0,
             }
         }
     }
@@ -649,7 +941,10 @@ mod tests_support {
             b[8..10].copy_from_slice(&1u16.to_le_bytes());
             b[14..16].copy_from_slice(&self.codec_mask.to_le_bytes());
             b[16..24].copy_from_slice(&total.to_le_bytes());
+            b[24..32].copy_from_slice(&self.stream_length.to_le_bytes());
             b[32..36].copy_from_slice(&self.block_size.to_le_bytes());
+            b[36..40].copy_from_slice(&self.inode_count.to_le_bytes());
+            b[40..44].copy_from_slice(&self.extent_count.to_le_bytes());
             b[44..48].copy_from_slice(&self.block_count.to_le_bytes());
             for (i, (off, size)) in placed.iter().enumerate() {
                 let base = 56 + i * 16;
@@ -662,6 +957,113 @@ mod tests_support {
             let mut image = b.to_vec();
             image.extend_from_slice(&body);
             image
+        }
+    }
+
+    /// Lays out a whole small filesystem: a stream split into stored blocks,
+    /// plus the metadata sections describing it.
+    pub struct Fs {
+        pub stream: Vec<u8>,
+        pub block_size: u32,
+        pub inodes: Vec<Inode>,
+        pub extents: Vec<Extent>,
+        pub dirents: Vec<Dirent>,
+        pub names: Vec<u8>,
+    }
+
+    fn enc_inode(i: &Inode) -> Vec<u8> {
+        let mut v = Vec::with_capacity(INODE_SIZE);
+        v.extend_from_slice(&i.size.to_le_bytes());
+        v.extend_from_slice(&i.payload.to_le_bytes());
+        v.extend_from_slice(&i.extent_count.to_le_bytes());
+        v.extend_from_slice(&i.mode.to_le_bytes());
+        v.extend_from_slice(&i.uid.to_le_bytes());
+        v.extend_from_slice(&i.gid.to_le_bytes());
+        v.extend_from_slice(&i.nlink.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v
+    }
+
+    fn enc_extent(e: &Extent) -> Vec<u8> {
+        let mut v = Vec::with_capacity(EXTENT_SIZE);
+        v.extend_from_slice(&e.stream_offset.to_le_bytes());
+        v.extend_from_slice(&e.file_offset.to_le_bytes());
+        v.extend_from_slice(&e.length.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v
+    }
+
+    fn enc_dirent(d: &Dirent) -> Vec<u8> {
+        let mut v = Vec::with_capacity(DIRENT_SIZE);
+        v.extend_from_slice(&d.inode.to_le_bytes());
+        v.extend_from_slice(&d.name_offset.to_le_bytes());
+        v.extend_from_slice(&d.name_length.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v
+    }
+
+    impl Fs {
+        pub fn build(&self) -> Vec<u8> {
+            let bs = self.block_size as usize;
+            let blocks: Vec<&[u8]> = self.stream.chunks(bs).collect();
+
+            let inodes: Vec<u8> = self.inodes.iter().flat_map(enc_inode).collect();
+            let dirents: Vec<u8> = self.dirents.iter().flat_map(enc_dirent).collect();
+            let extents: Vec<u8> = self.extents.iter().flat_map(enc_extent).collect();
+            let block_section_len = blocks.len() * 16;
+
+            // An empty section is absent, so it occupies no space at all.
+            let present: Vec<(SectionKind, Vec<u8>)> = [
+                (SectionKind::Inodes, inodes),
+                (SectionKind::Dirents, dirents),
+                (SectionKind::Names, self.names.clone()),
+                (SectionKind::Extents, extents),
+            ]
+            .into_iter()
+            .filter(|(_, c)| !c.is_empty())
+            .collect();
+
+            let padded = |n: usize| -> u64 { ((n as u64 + 8).div_ceil(4096)) * 4096 };
+            let mut data_at = 4096u64;
+            for (_, c) in &present {
+                data_at += padded(c.len());
+            }
+            if block_section_len > 0 {
+                data_at += padded(block_section_len);
+            }
+
+            let mut block_index = Vec::with_capacity(block_section_len);
+            let mut at = data_at;
+            for b in &blocks {
+                block_index.extend(block_entry(
+                    at,
+                    b.len() as u32,
+                    b.len() as u32,
+                    Codec::Stored,
+                ));
+                at += b.len() as u64 + 8;
+            }
+
+            let mut data = Vec::new();
+            for b in &blocks {
+                data.extend_from_slice(b);
+                data.extend_from_slice(&digest(b).to_le_bytes());
+            }
+
+            let mut builder = Builder::default()
+                .block_count(blocks.len() as u32)
+                .with_data(data);
+            builder.block_size = self.block_size;
+            builder.stream_length = self.stream.len() as u64;
+            builder.inode_count = self.inodes.len() as u32;
+            builder.extent_count = self.extents.len() as u32;
+            for (kind, content) in present {
+                builder = builder.section(kind, content);
+            }
+            if block_section_len > 0 {
+                builder = builder.section(SectionKind::Blocks, block_index);
+            }
+            builder.build()
         }
     }
 
@@ -1022,5 +1424,304 @@ mod robustness_tests {
         let sound = sound_image();
         let image = Image::new(sound.clone(), 0, sound.len() as u64).unwrap();
         assert_eq!(image.block_index().unwrap().count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::tests_support::Fs;
+    use super::*;
+    use crate::format::{S_IFDIR, S_IFLNK, S_IFREG};
+
+    const NAMES: &[u8] = b"alphabetalinktarget/path";
+
+    fn stream() -> Vec<u8> {
+        (0..8192u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn fs() -> Fs {
+        Fs {
+            stream: stream(),
+            block_size: 4096,
+            inodes: vec![
+                Inode {
+                    size: 3,
+                    payload: 0,
+                    extent_count: 0,
+                    mode: S_IFDIR | 0o755,
+                    uid: 0,
+                    gid: 0,
+                    nlink: 2,
+                },
+                Inode {
+                    size: 100,
+                    payload: 0,
+                    extent_count: 1,
+                    mode: S_IFREG | 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                    nlink: 1,
+                },
+                Inode {
+                    size: 250,
+                    payload: 0,
+                    extent_count: 2,
+                    mode: S_IFREG | 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                    nlink: 1,
+                },
+                Inode {
+                    size: 11,
+                    payload: 13,
+                    extent_count: 0,
+                    mode: S_IFLNK | 0o777,
+                    uid: 0,
+                    gid: 0,
+                    nlink: 1,
+                },
+            ],
+            extents: vec![
+                Extent {
+                    stream_offset: 4000,
+                    file_offset: 0,
+                    length: 200,
+                },
+                Extent {
+                    stream_offset: 100,
+                    file_offset: 200,
+                    length: 50,
+                },
+            ],
+            dirents: vec![
+                Dirent {
+                    inode: 1,
+                    name_offset: 0,
+                    name_length: 5,
+                },
+                Dirent {
+                    inode: 2,
+                    name_offset: 5,
+                    name_length: 4,
+                },
+                Dirent {
+                    inode: 3,
+                    name_offset: 9,
+                    name_length: 4,
+                },
+            ],
+            names: NAMES.to_vec(),
+        }
+    }
+
+    fn expected_beta() -> Vec<u8> {
+        let s = stream();
+        let mut v = s[4000..4200].to_vec();
+        v.extend_from_slice(&s[100..150]);
+        v
+    }
+
+    #[test]
+    fn reads_a_single_extent_file() {
+        let image = fs().build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let mut buf = vec![0u8; 100];
+        assert_eq!(r.read(1, 0, &mut buf).unwrap(), 100);
+        assert_eq!(buf, stream()[0..100]);
+    }
+
+    #[test]
+    fn reads_a_file_whose_extent_spans_a_block_boundary() {
+        let image = fs().build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let mut buf = vec![0u8; 250];
+        assert_eq!(r.read(2, 0, &mut buf).unwrap(), 250);
+        assert_eq!(buf, expected_beta());
+    }
+
+    #[test]
+    fn partial_reads_agree_with_the_whole() {
+        let image = fs().build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let whole = expected_beta();
+        for off in 0..250u64 {
+            for len in [1usize, 7, 64, 200] {
+                let mut buf = vec![0u8; len];
+                let n = r.read(2, off, &mut buf).unwrap();
+                let want = (250 - off as usize).min(len);
+                assert_eq!(n, want, "offset {off} len {len}");
+                assert_eq!(buf[..n], whole[off as usize..off as usize + n]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_past_the_end_returns_only_what_exists() {
+        let image = fs().build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let mut buf = vec![0xCCu8; 500];
+        assert_eq!(r.read(1, 90, &mut buf).unwrap(), 10);
+        assert_eq!(buf[..10], stream()[90..100]);
+        assert!(buf[10..].iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
+    fn a_read_at_or_after_the_end_returns_nothing() {
+        let image = fs().build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let mut buf = vec![0u8; 16];
+        assert_eq!(r.read(1, 100, &mut buf).unwrap(), 0);
+        assert_eq!(r.read(1, 10_000, &mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn reading_a_directory_or_link_fails() {
+        let image = fs().build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let mut buf = vec![0u8; 16];
+        assert!(r.read(0, 0, &mut buf).is_err());
+        assert!(r.read(3, 0, &mut buf).is_err());
+        assert!(r.read(99, 0, &mut buf).is_err());
+    }
+
+    #[test]
+    fn rejects_extents_that_do_not_tile() {
+        for bad in [
+            vec![
+                Extent {
+                    stream_offset: 4000,
+                    file_offset: 0,
+                    length: 200,
+                },
+                Extent {
+                    stream_offset: 100,
+                    file_offset: 210,
+                    length: 50,
+                },
+            ],
+            vec![
+                Extent {
+                    stream_offset: 4000,
+                    file_offset: 0,
+                    length: 200,
+                },
+                Extent {
+                    stream_offset: 100,
+                    file_offset: 190,
+                    length: 50,
+                },
+            ],
+            vec![
+                Extent {
+                    stream_offset: 4000,
+                    file_offset: 0,
+                    length: 200,
+                },
+                Extent {
+                    stream_offset: 100,
+                    file_offset: 200,
+                    length: 40,
+                },
+            ],
+        ] {
+            let mut f = fs();
+            f.extents = bad;
+            let image = f.build();
+            let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+            let r = img.reader().unwrap();
+            let mut buf = vec![0u8; 250];
+            assert!(r.read(2, 0, &mut buf).is_err());
+        }
+    }
+
+    #[test]
+    fn directory_entries_and_names_are_readable() {
+        let image = fs().build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let root = r.inode(0).unwrap();
+        assert_eq!(root.file_type(), Some(FileType::Directory));
+        let got: Vec<(u32, Vec<u8>)> = (0..root.size as u32)
+            .map(|i| {
+                let d = r.dirent(root.payload as u32 + i).unwrap();
+                (d.inode, r.name(d).unwrap().to_vec())
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1u32, b"alpha".to_vec()),
+                (2, b"beta".to_vec()),
+                (3, b"link".to_vec())
+            ]
+        );
+        let mut sorted = got.clone();
+        sorted.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(got, sorted, "directory entries must be sorted by name");
+    }
+
+    #[test]
+    fn a_symbolic_link_target_is_readable() {
+        let image = fs().build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        let link = r.inode(3).unwrap();
+        assert_eq!(link.file_type(), Some(FileType::Symlink));
+        let target = &NAMES[link.payload as usize..link.payload as usize + link.size as usize];
+        assert_eq!(target, b"target/path");
+    }
+
+    #[test]
+    fn resolution_does_not_scan_a_fragmented_file() {
+        let n = 4096u32;
+        let f = Fs {
+            stream: stream(),
+            block_size: 4096,
+            inodes: vec![Inode {
+                size: n as u64,
+                payload: 0,
+                extent_count: n,
+                mode: S_IFREG | 0o644,
+                uid: 0,
+                gid: 0,
+                nlink: 1,
+            }],
+            extents: (0..n)
+                .map(|i| Extent {
+                    stream_offset: i as u64,
+                    file_offset: i as u64,
+                    length: 1,
+                })
+                .collect(),
+            dirents: vec![],
+            names: vec![],
+        };
+        let image = f.build();
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+
+        let mut buf = [0u8; 1];
+        EXTENT_PROBES.with(|c| c.set(0));
+        assert_eq!(r.read(0, (n - 1) as u64, &mut buf).unwrap(), 1);
+        let probes = EXTENT_PROBES.with(|c| c.get());
+        assert_eq!(buf[0], stream()[(n - 1) as usize]);
+
+        // check_tiling walks the run once; resolution itself must be logarithmic.
+        let budget = n as usize + 2 * (n as f64).log2().ceil() as usize + 8;
+        assert!(
+            probes <= budget,
+            "resolution probed {probes} extents, budget {budget}"
+        );
+        let resolution_only = probes - n as usize;
+        assert!(
+            resolution_only <= 2 * (n as f64).log2().ceil() as usize + 4,
+            "resolution alone probed {resolution_only} extents for {n}"
+        );
     }
 }

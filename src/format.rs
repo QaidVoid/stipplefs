@@ -139,3 +139,85 @@ impl Superblock {
         self.sections[kind as usize]
     }
 }
+
+/// Size of one inode table entry.
+pub const INODE_SIZE: usize = 40;
+
+/// Size of one extent table entry.
+pub const EXTENT_SIZE: usize = 24;
+
+/// Size of one directory entry.
+pub const DIRENT_SIZE: usize = 12;
+
+/// POSIX file type bits.
+pub const S_IFMT: u32 = 0o170000;
+/// POSIX regular file type.
+pub const S_IFREG: u32 = 0o100000;
+/// POSIX directory type.
+pub const S_IFDIR: u32 = 0o040000;
+/// POSIX symbolic link type.
+pub const S_IFLNK: u32 = 0o120000;
+
+/// What kind of thing an inode describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    /// A regular file.
+    Regular,
+    /// A directory.
+    Directory,
+    /// A symbolic link.
+    Symlink,
+}
+
+/// One entry of the inode table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Inode {
+    /// File size, directory entry count, or symbolic link target length.
+    pub size: u64,
+    /// Meaning depends on the file type.
+    pub payload: u64,
+    /// Number of extents, zero for anything that is not a regular file.
+    pub extent_count: u32,
+    /// POSIX type and permission bits.
+    pub mode: u32,
+    /// Owning user.
+    pub uid: u32,
+    /// Owning group.
+    pub gid: u32,
+    /// Number of names referring to this inode.
+    pub nlink: u32,
+}
+
+impl Inode {
+    /// What kind of thing this inode describes, if the format defines it.
+    pub fn file_type(&self) -> Option<FileType> {
+        match self.mode & S_IFMT {
+            S_IFREG => Some(FileType::Regular),
+            S_IFDIR => Some(FileType::Directory),
+            S_IFLNK => Some(FileType::Symlink),
+            _ => None,
+        }
+    }
+}
+
+/// One entry of the extent table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    /// Where the content lives in the logical stream.
+    pub stream_offset: u64,
+    /// Where the extent begins within the file.
+    pub file_offset: u64,
+    /// Length in bytes.
+    pub length: u32,
+}
+
+/// One directory entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dirent {
+    /// Inode this name refers to.
+    pub inode: u32,
+    /// Byte offset of the name within the name table.
+    pub name_offset: u32,
+    /// Length of the name in bytes.
+    pub name_length: u16,
+}

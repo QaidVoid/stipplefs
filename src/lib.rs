@@ -6,3 +6,8 @@
 //! build may enable either, both, or neither.
 
 #![warn(missing_docs)]
+
+pub mod error;
+
+#[cfg(feature = "read")]
+pub mod source;

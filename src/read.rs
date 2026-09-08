@@ -735,7 +735,16 @@ impl<'i> Reader<'i> {
             let decoded = match e.codec {
                 Codec::Stored => raw,
                 #[cfg(feature = "zstd")]
-                Codec::Zstd => self.phase(|m| &m.decode_ns, || zstd::decode_all(&raw[..]))?,
+                Codec::Zstd => {
+                    // The decoded size is recorded, so decompress into one
+                    // exactly sized allocation. `decode_all` does not know the
+                    // size and grows its buffer as it goes.
+                    let mut d = zstd::bulk::Decompressor::new()?;
+                    self.phase(
+                        |m| &m.decode_ns,
+                        || d.decompress(&raw, e.decoded_length as usize),
+                    )?
+                }
                 #[cfg(not(feature = "zstd"))]
                 Codec::Zstd => {
                     return Err(Error::UnsupportedCodec {
@@ -836,9 +845,19 @@ impl<'i> Reader<'i> {
 }
 
 impl<'a> Image<'a> {
-    /// Build a reader with the default cache budget.
+    /// Build a reader with a cache budget suited to the image.
+    ///
+    /// The default holds a few hundred blocks at a small block size, but an
+    /// image built with very large blocks needs room for at least a couple of
+    /// them, so the budget is raised to fit when necessary.
     pub fn reader(&self) -> Result<Reader<'_>> {
-        self.reader_with_budget(DEFAULT_CACHE_BUDGET)
+        self.reader_with_budget(self.default_budget())
+    }
+
+    /// The budget [`Image::reader`] would use.
+    pub fn default_budget(&self) -> usize {
+        let two_blocks = (self.superblock.block_size as usize).saturating_mul(2);
+        DEFAULT_CACHE_BUDGET.max(two_blocks)
     }
 
     /// Build a reader whose decoded-block cache holds at most `budget` bytes.

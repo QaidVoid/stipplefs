@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use stipplefs::format::FileType;
-use stipplefs::read::{DEFAULT_CACHE_BUDGET, Image, Reader};
+use stipplefs::read::{Image, Reader};
 
 #[derive(Parser)]
 #[command(
@@ -67,9 +67,10 @@ struct Located {
     /// Length of the image in bytes. Defaults to the rest of the file.
     #[arg(long)]
     length: Option<u64>,
-    /// Bytes of decoded blocks the reader may retain.
-    #[arg(long, default_value_t = DEFAULT_CACHE_BUDGET)]
-    cache_budget: usize,
+    /// Bytes of decoded blocks the reader may retain. Defaults to a size
+    /// suited to the image's block size.
+    #[arg(long)]
+    cache_budget: Option<usize>,
     /// Map the image instead of reading it, so blocks are taken in place.
     #[cfg(feature = "mmap")]
     #[arg(long)]
@@ -121,8 +122,11 @@ fn walk(
 fn check(located: Located) -> Result<(), String> {
     let image = located.open()?;
     let sb = *image.superblock();
+    let budget = located
+        .cache_budget
+        .unwrap_or_else(|| image.default_budget());
     let reader = image
-        .reader_with_budget(located.cache_budget)
+        .reader_with_budget(budget)
         .map_err(|e| e.to_string())?;
 
     let mut files = 0u64;
@@ -171,8 +175,11 @@ fn check(located: Located) -> Result<(), String> {
 
 fn extract(located: Located, destination: PathBuf, subtree: Option<String>) -> Result<(), String> {
     let image = located.open()?;
+    let budget = located
+        .cache_budget
+        .unwrap_or_else(|| image.default_budget());
     let reader = image
-        .reader_with_budget(located.cache_budget)
+        .reader_with_budget(budget)
         .map_err(|e| e.to_string())?;
     let want = subtree.as_deref().map(Path::new);
 
@@ -244,8 +251,10 @@ fn mount(
 ) -> Result<(), String> {
     use fuser::{Config, MountOption, SessionACL};
 
-    let budget = located.cache_budget;
     let image = located.open()?;
+    let budget = located
+        .cache_budget
+        .unwrap_or_else(|| image.default_budget());
     let fs = stipplefs::mount::Mount::new(image, budget).map_err(|e| e.to_string())?;
 
     let mut config = Config::default();
@@ -268,8 +277,11 @@ fn mount(
 
 fn bench(located: Located, reads: usize, seed: u64) -> Result<(), String> {
     let image = located.open()?;
+    let budget = located
+        .cache_budget
+        .unwrap_or_else(|| image.default_budget());
     let reader = image
-        .reader_with_budget(located.cache_budget)
+        .reader_with_budget(budget)
         .map_err(|e| e.to_string())?;
 
     let mut files: Vec<(u32, u64)> = Vec::new();

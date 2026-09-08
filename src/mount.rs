@@ -40,6 +40,11 @@ impl Mount {
         Ok(Mount { reader })
     }
 
+    /// The reader behind this mount, so a caller can read its counters.
+    pub fn reader(&self) -> &'static Reader<'static> {
+        self.reader
+    }
+
     /// The kernel numbers the root 1, while the format numbers it 0.
     fn to_image(ino: INodeNo) -> Option<u32> {
         u32::try_from(ino.0.checked_sub(1)?).ok()

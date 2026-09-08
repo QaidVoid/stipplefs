@@ -191,6 +191,21 @@ Sorting is by unsigned byte value, so lookup is a binary search. Names are raw
 bytes and SHALL NOT contain `0x00` or `/`. The name table is a concatenation of
 name bytes with no separators and no terminators.
 
+## Dictionaries
+
+The dictionaries section holds a single Zstandard dictionary, and its content
+is exactly that dictionary's bytes. A block whose codec is `zstd-dict` is
+decoded with it.
+
+An image that uses `zstd-dict` SHALL have a present dictionaries section, and
+an image that does not use `zstd-dict` SHALL have it absent. A reader SHALL
+reject an image that sets the `zstd-dict` bit in `codec_mask` without a
+dictionaries section.
+
+One dictionary per image is deliberate. Blocks are compressed independently and
+seeded from the same dictionary, which is what lets a small block reach a ratio
+close to a much larger one without enlarging the decode unit.
+
 ## Integrity
 
 | Covered | Digest location |

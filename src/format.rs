@@ -90,6 +90,7 @@ pub const fn supported_codecs() -> u16 {
     #[cfg(feature = "zstd")]
     {
         mask |= Codec::Zstd.bit();
+        mask |= Codec::ZstdDict.bit();
     }
     mask
 }

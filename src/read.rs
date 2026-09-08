@@ -370,6 +370,8 @@ pub struct Reader<'i> {
     names: SectionData<'i>,
     blocks: BlockIndex<'i>,
     cache: crate::cache::BlockCache,
+    #[cfg(feature = "zstd")]
+    dictionary: Option<zstd::dict::DecoderDictionary<'static>>,
 }
 
 // Counts extent table probes so tests can check that resolution does not scan
@@ -588,6 +590,15 @@ impl<'i> Reader<'i> {
                         missing: e.codec.bit(),
                     });
                 }
+                #[cfg(feature = "zstd")]
+                Codec::ZstdDict => {
+                    let dict = self.dictionary.as_ref().ok_or(Error::Malformed {
+                        detail: "a block uses the image dictionary but none is present",
+                    })?;
+                    let mut d = zstd::bulk::Decompressor::with_prepared_dictionary(dict)?;
+                    d.decompress(&raw, e.decoded_length as usize)?
+                }
+                #[cfg(not(feature = "zstd"))]
                 Codec::ZstdDict => {
                     return Err(Error::UnsupportedCodec {
                         missing: e.codec.bit(),
@@ -676,6 +687,20 @@ impl<'a> Image<'a> {
             names: self.section_data(SectionKind::Names)?,
             blocks: self.block_index()?,
             cache: crate::cache::BlockCache::new(budget),
+            #[cfg(feature = "zstd")]
+            dictionary: {
+                let d = self.section_data(SectionKind::Dictionaries)?;
+                if d.is_empty() {
+                    if self.superblock.codec_mask & Codec::ZstdDict.bit() != 0 {
+                        return Err(Error::Malformed {
+                            detail: "codec_mask names zstd-dict but no dictionary is present",
+                        });
+                    }
+                    None
+                } else {
+                    Some(zstd::dict::DecoderDictionary::copy(&d))
+                }
+            },
         })
     }
 }
@@ -855,6 +880,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "zstd"))]
     #[test]
     fn rejects_a_codec_this_build_cannot_decode() {
         let mut b = fixture();
@@ -1034,6 +1060,7 @@ mod tests_support {
     /// plus the metadata sections describing it.
     pub struct Fs {
         pub stream: Vec<u8>,
+        pub dictionary: Option<Vec<u8>>,
         pub codec: Codec,
         pub block_size: u32,
         pub inodes: Vec<Inode>,
@@ -1091,6 +1118,11 @@ mod tests_support {
                 (SectionKind::Extents, extents),
             ]
             .into_iter()
+            .chain(
+                self.dictionary
+                    .clone()
+                    .map(|d| (SectionKind::Dictionaries, d)),
+            )
             .filter(|(_, c)| !c.is_empty())
             .collect();
 
@@ -1108,6 +1140,12 @@ mod tests_support {
                 .map(|b| match self.codec {
                     #[cfg(feature = "zstd")]
                     Codec::Zstd => zstd::encode_all(&b[..], 3).unwrap(),
+                    #[cfg(feature = "zstd")]
+                    Codec::ZstdDict => {
+                        let dict = self.dictionary.as_deref().unwrap_or_default();
+                        let mut c = zstd::bulk::Compressor::with_dictionary(3, dict).unwrap();
+                        c.compress(b).unwrap()
+                    }
                     _ => b.to_vec(),
                 })
                 .collect();
@@ -1280,6 +1318,7 @@ mod section_tests {
         assert!(matches!(opened.block_index(), Err(Error::Malformed { .. })));
     }
 
+    #[cfg(not(feature = "zstd"))]
     #[test]
     fn rejects_a_block_whose_codec_is_absent_from_the_mask() {
         let probe = Builder::default().section(SectionKind::Blocks, vec![0u8; 16]);
@@ -1526,6 +1565,7 @@ mod read_tests {
     pub fn fs() -> Fs {
         Fs {
             stream: stream(),
+            dictionary: None,
             codec: Codec::Stored,
             block_size: 4096,
             inodes: vec![
@@ -1767,6 +1807,7 @@ mod read_tests {
         let n = 4096u32;
         let f = Fs {
             stream: stream(),
+            dictionary: None,
             codec: Codec::Stored,
             block_size: 4096,
             inodes: vec![Inode {
@@ -1943,5 +1984,160 @@ mod zstd_tests {
         let r = img.reader().unwrap();
         let mut buf = vec![0u8; 100];
         assert!(r.read(1, 0, &mut buf).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "zstd"))]
+mod dictionary_tests {
+    use super::read_tests::fs as base_fs;
+    use super::*;
+
+    fn dict() -> Vec<u8> {
+        (0..2048u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_dictionary_compressed_image_reads_correctly() {
+        let mut f = base_fs();
+        f.codec = Codec::ZstdDict;
+        f.dictionary = Some(dict());
+        let image = f.build();
+
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        assert_eq!(
+            img.superblock().codec_mask & Codec::ZstdDict.bit(),
+            Codec::ZstdDict.bit()
+        );
+        let r = img.reader().unwrap();
+
+        let plain = base_fs().build();
+        let ip = Image::new(plain.clone(), 0, plain.len() as u64).unwrap();
+        let rp = ip.reader().unwrap();
+
+        for ino in [1u32, 2] {
+            let size = r.inode(ino).unwrap().size as usize;
+            let mut got = vec![0u8; size];
+            let mut want = vec![0u8; size];
+            r.read(ino, 0, &mut got).unwrap();
+            rp.read(ino, 0, &mut want).unwrap();
+            assert_eq!(
+                got, want,
+                "inode {ino} differs under dictionary compression"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dictionary_shrinks_the_stored_bytes() {
+        let stored_total = |img: &[u8]| -> u32 {
+            let i = Image::new(img.to_vec(), 0, img.len() as u64).unwrap();
+            let idx = i.block_index().unwrap();
+            (0..idx.count())
+                .map(|k| idx.get(k).unwrap().stored_length)
+                .sum()
+        };
+        let mut plain = base_fs();
+        plain.codec = Codec::Zstd;
+        let mut with_dict = base_fs();
+        with_dict.codec = Codec::ZstdDict;
+        with_dict.dictionary = Some(dict());
+
+        let a = stored_total(&with_dict.build());
+        let b = stored_total(&plain.build());
+        assert!(a < b, "dictionary should shrink stored bytes: {a} vs {b}");
+    }
+
+    #[test]
+    fn an_image_naming_the_dictionary_codec_without_one_is_rejected() {
+        let mut f = base_fs();
+        f.codec = Codec::ZstdDict;
+        f.dictionary = Some(dict());
+        let mut image = f.build();
+
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let d = img.superblock().section(SectionKind::Dictionaries);
+        assert!(!d.is_absent());
+
+        // Blank the dictionaries section entry, keeping the codec mask.
+        let base = 56 + (SectionKind::Dictionaries as usize) * 16;
+        image[base..base + 16].copy_from_slice(&[0u8; 16]);
+        let sb = digest(&image[..Superblock::CHECKSUM_OFFSET]).to_le_bytes();
+        image[Superblock::CHECKSUM_OFFSET..SUPERBLOCK_SIZE].copy_from_slice(&sb);
+
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        assert!(
+            img.reader().is_err(),
+            "an image using the dictionary codec without a dictionary must be rejected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::read_tests::fs as base_fs;
+    use super::*;
+
+    #[test]
+    fn corruption_is_detected_in_every_present_section() {
+        let image = base_fs().build();
+        let probe = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let present: Vec<SectionKind> = [
+            SectionKind::Inodes,
+            SectionKind::Dirents,
+            SectionKind::Names,
+            SectionKind::Extents,
+            SectionKind::Blocks,
+        ]
+        .into_iter()
+        .filter(|k| !probe.superblock().section(*k).is_absent())
+        .collect();
+        assert!(
+            present.len() >= 4,
+            "fixture should exercise several sections"
+        );
+
+        for kind in present {
+            let mut bad = image.clone();
+            let at = probe.superblock().section(kind).offset as usize;
+            bad[at] ^= 0xff;
+            let img = Image::new(bad.clone(), 0, bad.len() as u64).unwrap();
+            assert!(
+                matches!(img.section_data(kind), Err(Error::ChecksumMismatch { .. })),
+                "corruption in {kind:?} went undetected"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupted_block_content_yields_an_error_and_no_bytes() {
+        let image = base_fs().build();
+        let probe = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let first = probe.block_index().unwrap().get(0).unwrap();
+
+        let mut bad = image.clone();
+        bad[first.image_offset as usize] ^= 0xff;
+        let img = Image::new(bad.clone(), 0, bad.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+
+        let mut buf = vec![0xAAu8; 100];
+        let outcome = r.read(1, 0, &mut buf);
+        assert!(
+            matches!(outcome, Err(Error::ChecksumMismatch { what: "block" })),
+            "expected an integrity error, got {outcome:?}"
+        );
+        assert!(
+            buf.iter().all(|&b| b == 0xAA),
+            "corrupted bytes must not reach the caller"
+        );
+    }
+
+    #[test]
+    fn a_corrupted_superblock_is_detected_before_anything_else() {
+        let mut bad = base_fs().build();
+        bad[36] ^= 0xff;
+        assert!(matches!(
+            Image::new(bad.clone(), 0, bad.len() as u64),
+            Err(Error::ChecksumMismatch { what: "superblock" })
+        ));
     }
 }

@@ -1,7 +1,11 @@
 //! Building images.
 //!
-//! The writer holds the logical stream in memory, so it suits trees that fit
-//! comfortably in RAM. Output is byte-identical for identical input.
+//! The logical stream and the encoded blocks live in a scratch file, and a
+//! file added from disk is read only when its bytes are placed, so what the
+//! writer holds does not grow with the size of the tree. [`Options`] carries a
+//! ceiling on the blocks held while compressing; it does not cover the working
+//! memory the compressor itself allocates for a given block size and level.
+//! Output is byte-identical for identical input.
 
 use crate::chunk::{ChunkerConfig, chunks};
 use crate::error::{Error, Result};
@@ -30,6 +34,9 @@ pub struct Options {
     pub dictionary_size: usize,
     /// Worker threads used to compress blocks. Output does not depend on this.
     pub threads: usize,
+    /// Rough ceiling on the memory used to compress blocks, in bytes. `None`
+    /// lets every worker hold a block. Output does not depend on this.
+    pub memory_limit: Option<usize>,
     /// What to record for modification times.
     pub timestamps: Timestamps,
 }
@@ -55,6 +62,7 @@ impl Default for Options {
             level: 19,
             dictionary_size: 112 * 1024,
             threads: 1,
+            memory_limit: None,
             timestamps: Timestamps::default(),
         }
     }
@@ -149,6 +157,16 @@ struct Dir {
 enum Tree {
     Dir(Dir),
     Node(Node),
+    /// A file whose bytes stay on disk until they are placed, so that adding a
+    /// tree does not hold every file in it in memory at once.
+    #[cfg(feature = "fs")]
+    FileAt {
+        path: std::path::PathBuf,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        link_group: Option<u64>,
+    },
 }
 
 /// One extended attribute: a name and a value, both arbitrary bytes.
@@ -231,6 +249,19 @@ impl Builder {
     /// Intermediate directories are created with default ownership if they
     /// have not been added already.
     pub fn insert(&mut self, path: &[u8], node: Node) -> Result<()> {
+        let entry = match node {
+            Node::Directory { mode, uid, gid } => Tree::Dir(Dir {
+                children: BTreeMap::new(),
+                mode,
+                uid,
+                gid,
+            }),
+            other => Tree::Node(other),
+        };
+        self.insert_tree(path, entry)
+    }
+
+    fn insert_tree(&mut self, path: &[u8], entry: Tree) -> Result<()> {
         let parts: Vec<&[u8]> = path
             .split(|&b| b == b'/')
             .filter(|p| !p.is_empty())
@@ -255,7 +286,7 @@ impl Builder {
             });
             match entry {
                 Tree::Dir(d) => dir = d,
-                Tree::Node(_) => {
+                _ => {
                     return Err(Error::Malformed {
                         detail: "a path component names something that is not a directory",
                     });
@@ -263,15 +294,6 @@ impl Builder {
             }
         }
         let last = parts[parts.len() - 1].to_vec();
-        let entry = match node {
-            Node::Directory { mode, uid, gid } => Tree::Dir(Dir {
-                children: BTreeMap::new(),
-                mode,
-                uid,
-                gid,
-            }),
-            other => Tree::Node(other),
-        };
         match (dir.children.get_mut(&last), &entry) {
             (Some(Tree::Dir(existing)), Tree::Dir(new)) => {
                 existing.mode = new.mode;
@@ -307,14 +329,13 @@ struct DirentRec {
     name_length: u16,
 }
 
-#[derive(Default)]
 struct Plan {
     inodes: Vec<InodeRec>,
     dirents: Vec<DirentRec>,
     names: Vec<u8>,
     name_at: HashMap<Vec<u8>, u32>,
     extents: Vec<(u64, u64, u32)>,
-    stream: Vec<u8>,
+    stream: Spill,
     seen: HashMap<u128, u64>,
     links: HashMap<u64, u32>,
     /// Distinct attribute sets, in order of first reference.
@@ -323,6 +344,21 @@ struct Plan {
 }
 
 impl Plan {
+    fn new(stream: Spill) -> Self {
+        Plan {
+            inodes: Vec::new(),
+            dirents: Vec::new(),
+            names: Vec::new(),
+            name_at: HashMap::new(),
+            extents: Vec::new(),
+            stream,
+            seen: HashMap::new(),
+            links: HashMap::new(),
+            xattr_sets: Vec::new(),
+            xattr_index: HashMap::new(),
+        }
+    }
+
     fn intern(&mut self, name: &[u8]) -> Result<u32> {
         if let Some(at) = self.name_at.get(name) {
             return Ok(*at);
@@ -342,10 +378,20 @@ impl Plan {
 }
 
 impl Builder {
-    /// Produce the image.
+    /// Produce the image in memory.
+    ///
+    /// Use [`Builder::build_into`] for trees large enough that holding the
+    /// finished image is itself the constraint.
     pub fn build(self) -> Result<Vec<u8>> {
+        let mut image = Vec::new();
+        self.build_into(&mut image)?;
+        Ok(image)
+    }
+
+    /// Produce the image, writing it out as it is assembled.
+    pub fn build_into(self, out: &mut dyn std::io::Write) -> Result<()> {
         let cfg = ChunkerConfig::new(self.options.chunk_average);
-        let mut plan = Plan::default();
+        let mut plan = Plan::new(Spill::create()?);
         let root = plan.alloc();
         self.visit(&self.root, root, &mut plan, &cfg, &[])?;
 
@@ -357,7 +403,7 @@ impl Builder {
             rec.nlink = if i == 0 { 2 } else { counts[i].max(1) };
         }
 
-        self.emit(plan)
+        self.emit(plan, out)
     }
 
     fn visit(
@@ -394,6 +440,11 @@ impl Builder {
                     link_group: Some(g),
                     ..
                 }) if plan.links.contains_key(g) => plan.links[g],
+                #[cfg(feature = "fs")]
+                Tree::FileAt {
+                    link_group: Some(g),
+                    ..
+                } if plan.links.contains_key(g) => plan.links[g],
                 _ => plan.alloc(),
             };
             plan.dirents[start + i] = DirentRec {
@@ -412,6 +463,23 @@ impl Builder {
                     self.visit(d, child, plan, cfg, &nested)?
                 }
                 Tree::Node(node) => self.emit_node(child, node, plan, cfg)?,
+                #[cfg(feature = "fs")]
+                Tree::FileAt {
+                    path,
+                    mode,
+                    uid,
+                    gid,
+                    link_group,
+                } => {
+                    let node = Node::File {
+                        content: std::fs::read(path)?,
+                        mode: *mode,
+                        uid: *uid,
+                        gid: *gid,
+                        link_group: *link_group,
+                    };
+                    self.emit_node(child, &node, plan, cfg)?
+                }
             }
 
             let mut key = prefix.to_vec();
@@ -546,8 +614,7 @@ impl Builder {
             let at = match plan.seen.get(&key) {
                 Some(at) => *at,
                 None => {
-                    let at = plan.stream.len() as u64;
-                    plan.stream.extend_from_slice(piece);
+                    let at = plan.stream.append(piece)?;
                     plan.seen.insert(key, at);
                     at
                 }
@@ -569,15 +636,101 @@ impl Builder {
     }
 }
 
+/// A scratch file holding the logical stream, and then the encoded blocks,
+/// while an image is built.
+///
+/// Both are written once and read back once, which is what keeps the writer's
+/// memory independent of the size of the tree being packed. The file is
+/// unlinked as soon as it is open, so it costs nothing if the process dies.
+struct Spill {
+    file: std::fs::File,
+    buffer: Vec<u8>,
+    len: u64,
+}
+
+impl Spill {
+    const BUFFER: usize = 1 << 20;
+
+    fn create() -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let directory = std::env::temp_dir();
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!("stipplefs-{}-{nonce}.tmp", std::process::id()));
+        let fail = |e: std::io::Error| Error::Temporary {
+            directory: directory.display().to_string(),
+            detail: e.to_string(),
+        };
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(fail)?;
+        std::fs::remove_file(&path).map_err(fail)?;
+        Ok(Spill {
+            file,
+            buffer: Vec::with_capacity(Self::BUFFER),
+            len: 0,
+        })
+    }
+
+    /// Append `bytes` and return the offset they were written at.
+    fn append(&mut self, bytes: &[u8]) -> Result<u64> {
+        use std::io::Write;
+        let at = self.len;
+        if self.buffer.len() + bytes.len() > Self::BUFFER {
+            self.flush()?;
+        }
+        if bytes.len() >= Self::BUFFER {
+            self.file.write_all(bytes)?;
+        } else {
+            self.buffer.extend_from_slice(bytes);
+        }
+        self.len += bytes.len() as u64;
+        Ok(at)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        use std::io::Write;
+        if !self.buffer.is_empty() {
+            self.file.write_all(&self.buffer)?;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+
+    /// Fill `buf` from `at`. Everything read must already have been flushed.
+    fn read_at(&self, at: u64, buf: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(buf, at)?;
+        Ok(())
+    }
+}
+
 fn digest(bytes: &[u8]) -> u64 {
     twox_hash::XxHash3_64::oneshot(bytes)
 }
 
-fn pad_to_alignment(v: &mut Vec<u8>) {
-    let over = v.len() as u64 % ALIGNMENT;
-    if over != 0 {
-        v.resize(v.len() + (ALIGNMENT - over) as usize, 0);
+/// Where one compressed block ended up in the scratch file, and what the
+/// block index has to say about it.
+struct EncodedBlock {
+    codec: Codec,
+    offset: u64,
+    encoded_length: u32,
+    decoded_length: u32,
+    digest: u64,
+}
+
+fn write_zeros(out: &mut dyn std::io::Write, mut n: u64) -> Result<()> {
+    const ZEROS: [u8; 1024] = [0u8; 1024];
+    while n > 0 {
+        let take = (ZEROS.len() as u64).min(n) as usize;
+        out.write_all(&ZEROS[..take])?;
+        n -= take as u64;
     }
+    Ok(())
 }
 
 impl Builder {
@@ -651,29 +804,47 @@ impl Builder {
     /// Selecting samples from a hash container here would reintroduce exactly
     /// the non-determinism the rest of the writer avoids.
     #[allow(unused_variables)]
-    fn train_dictionary(&self, blocks: &[&[u8]]) -> Option<Vec<u8>> {
+    fn train_dictionary(
+        &self,
+        stream: &Spill,
+        block_count: usize,
+        block_size: usize,
+    ) -> Result<Option<Vec<u8>>> {
         #[cfg(feature = "dict")]
         {
             if self.options.dictionary_size == 0
                 || self.options.codecs & Codec::ZstdDict.bit() == 0
-                || blocks.len() < 8
+                || block_count < 8
             {
-                return None;
+                return Ok(None);
             }
             const TARGET_SAMPLES: usize = 128;
-            let stride = blocks.len().div_ceil(TARGET_SAMPLES).max(1);
-            let samples: Vec<&[u8]> = blocks.iter().step_by(stride).copied().collect();
-            if samples.len() < 8 {
-                return None;
+            const SAMPLE_BYTES: usize = 256 * 1024;
+            let stride = block_count.div_ceil(TARGET_SAMPLES).max(1);
+            let width = block_size.min(SAMPLE_BYTES);
+            let mut samples: Vec<Vec<u8>> = Vec::new();
+            let mut index = 0;
+            while index < block_count {
+                let at = (index * block_size) as u64;
+                let len = (width as u64).min(stream.len - at) as usize;
+                let mut b = vec![0u8; len];
+                stream.read_at(at, &mut b)?;
+                samples.push(b);
+                index += stride;
             }
-            zstd::dict::from_samples(&samples, self.options.dictionary_size).ok()
+            if samples.len() < 8 {
+                return Ok(None);
+            }
+            let refs: Vec<&[u8]> = samples.iter().map(|b| b.as_slice()).collect();
+            Ok(zstd::dict::from_samples(&refs, self.options.dictionary_size).ok())
         }
         #[cfg(not(feature = "dict"))]
-        None
+        Ok(None)
     }
 
-    fn emit(&self, plan: Plan) -> Result<Vec<u8>> {
+    fn emit(&self, mut plan: Plan, out: &mut dyn std::io::Write) -> Result<()> {
         let (inodes, attributes) = encode_inodes(&plan.inodes);
+        let names = std::mem::take(&mut plan.names);
         let xattrs = encode_xattrs(&plan.xattr_sets);
 
         let mut dirents = Vec::with_capacity(plan.dirents.len() * DIRENT_SIZE);
@@ -693,16 +864,25 @@ impl Builder {
         }
 
         let block_size = self.options.block_size as usize;
-        let raw_blocks: Vec<&[u8]> = plan.stream.chunks(block_size).collect();
-        let dictionary = self.train_dictionary(&raw_blocks);
-        let encoded = self.encode_blocks(&raw_blocks, dictionary.as_deref());
-        let block_section_len = encoded.len() * BLOCK_ENTRY_SIZE;
+        plan.stream.flush()?;
+        let stream_len = plan.stream.len;
+        let block_count = (stream_len as usize).div_ceil(block_size.max(1));
+
+        let dictionary = self.train_dictionary(&plan.stream, block_count, block_size)?;
+        let blocks = self.encode_stream(
+            &mut plan.stream,
+            block_count,
+            block_size,
+            dictionary.as_deref(),
+        )?;
+        plan.stream.flush()?;
+        let block_section_len = block_count * BLOCK_ENTRY_SIZE;
 
         let mut sections: Vec<(SectionKind, Vec<u8>)> = Vec::new();
         for (kind, content) in [
             (SectionKind::Inodes, inodes),
             (SectionKind::Dirents, dirents),
-            (SectionKind::Names, plan.names),
+            (SectionKind::Names, names),
             (SectionKind::Extents, extents),
             (SectionKind::Attributes, attributes),
             (SectionKind::ExtendedAttributes, xattrs),
@@ -728,14 +908,14 @@ impl Builder {
         let mut block_index = Vec::with_capacity(block_section_len);
         let mut at = data_at;
         let mut codec_mask = Codec::Stored.bit();
-        for ((codec, enc), raw) in encoded.iter().zip(&raw_blocks) {
-            codec_mask |= codec.bit();
+        for b in &blocks {
+            codec_mask |= b.codec.bit();
             block_index.extend_from_slice(&at.to_le_bytes());
-            block_index.extend_from_slice(&(enc.len() as u32).to_le_bytes());
-            block_index.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-            block_index.push(codec.id());
+            block_index.extend_from_slice(&b.encoded_length.to_le_bytes());
+            block_index.extend_from_slice(&b.decoded_length.to_le_bytes());
+            block_index.push(b.codec.id());
             block_index.extend_from_slice(&[0u8; 3]);
-            at += enc.len() as u64 + 8;
+            at += b.encoded_length as u64 + 8;
         }
         if block_section_len > 0 {
             sections.push((SectionKind::Blocks, block_index));
@@ -744,24 +924,14 @@ impl Builder {
             sections.push((SectionKind::Dictionaries, d));
         }
 
-        let mut body = Vec::new();
         let mut placed = [(0u64, 0u64); SECTION_COUNT];
         let mut cursor = ALIGNMENT;
         for (kind, content) in &sections {
-            let size = content.len() as u64 + 8;
-            placed[*kind as usize] = (cursor, size);
-            body.extend_from_slice(content);
-            body.extend_from_slice(&digest(content).to_le_bytes());
-            pad_to_alignment(&mut body);
-            cursor = ALIGNMENT + body.len() as u64;
+            placed[*kind as usize] = (cursor, content.len() as u64 + 8);
+            cursor += padded(content.len());
         }
-        for (_, enc) in &encoded {
-            body.extend_from_slice(enc);
-            body.extend_from_slice(&digest(enc).to_le_bytes());
-        }
-        pad_to_alignment(&mut body);
-
-        let image_length = ALIGNMENT + body.len() as u64;
+        let block_bytes: u64 = blocks.iter().map(|b| b.encoded_length as u64 + 8).sum();
+        let image_length = (data_at + block_bytes).div_ceil(ALIGNMENT) * ALIGNMENT;
 
         let mut sb = [0u8; SUPERBLOCK_SIZE];
         sb[0..8].copy_from_slice(&MAGIC);
@@ -769,11 +939,11 @@ impl Builder {
         sb[10..12].copy_from_slice(&VERSION_MINOR.to_le_bytes());
         sb[14..16].copy_from_slice(&codec_mask.to_le_bytes());
         sb[16..24].copy_from_slice(&image_length.to_le_bytes());
-        sb[24..32].copy_from_slice(&(plan.stream.len() as u64).to_le_bytes());
+        sb[24..32].copy_from_slice(&stream_len.to_le_bytes());
         sb[32..36].copy_from_slice(&self.options.block_size.to_le_bytes());
         sb[36..40].copy_from_slice(&(plan.inodes.len() as u32).to_le_bytes());
         sb[40..44].copy_from_slice(&(plan.extents.len() as u32).to_le_bytes());
-        sb[44..48].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+        sb[44..48].copy_from_slice(&(blocks.len() as u32).to_le_bytes());
         sb[48..52].copy_from_slice(&0u32.to_le_bytes());
         for (i, (off, size)) in placed.iter().enumerate() {
             let base = 56 + i * 16;
@@ -783,9 +953,83 @@ impl Builder {
         let d = digest(&sb[..Superblock::CHECKSUM_OFFSET]);
         sb[Superblock::CHECKSUM_OFFSET..].copy_from_slice(&d.to_le_bytes());
 
-        let mut image = sb.to_vec();
-        image.extend_from_slice(&body);
-        Ok(image)
+        out.write_all(&sb)?;
+        let mut written = ALIGNMENT;
+        for (_, content) in &sections {
+            out.write_all(content)?;
+            out.write_all(&digest(content).to_le_bytes())?;
+            let end = written + padded(content.len());
+            write_zeros(out, end - written - content.len() as u64 - 8)?;
+            written = end;
+        }
+        let mut buf = vec![0u8; Spill::BUFFER.min(block_size.max(1))];
+        for b in &blocks {
+            let mut left = b.encoded_length as u64;
+            let mut from = b.offset;
+            while left > 0 {
+                let take = (buf.len() as u64).min(left) as usize;
+                plan.stream.read_at(from, &mut buf[..take])?;
+                out.write_all(&buf[..take])?;
+                from += take as u64;
+                left -= take as u64;
+            }
+            out.write_all(&b.digest.to_le_bytes())?;
+            written += b.encoded_length as u64 + 8;
+        }
+        write_zeros(out, image_length - written)?;
+        Ok(())
+    }
+
+    /// Compress the stream one bounded batch of blocks at a time, appending
+    /// each encoded block to the same scratch file.
+    fn encode_stream(
+        &self,
+        stream: &mut Spill,
+        block_count: usize,
+        block_size: usize,
+        dict: Option<&[u8]>,
+    ) -> Result<Vec<EncodedBlock>> {
+        let stream_len = stream.len;
+        let batch = self.batch_size(block_size);
+        let mut blocks = Vec::with_capacity(block_count);
+        let mut index = 0;
+        while index < block_count {
+            let n = batch.min(block_count - index);
+            let mut raw: Vec<Vec<u8>> = Vec::with_capacity(n);
+            for k in 0..n {
+                let at = ((index + k) * block_size) as u64;
+                let len = (block_size as u64).min(stream_len - at) as usize;
+                let mut b = vec![0u8; len];
+                stream.read_at(at, &mut b)?;
+                raw.push(b);
+            }
+            let refs: Vec<&[u8]> = raw.iter().map(|b| b.as_slice()).collect();
+            let encoded = self.encode_blocks(&refs, dict);
+            for ((codec, enc), decoded) in encoded.iter().zip(&raw) {
+                blocks.push(EncodedBlock {
+                    codec: *codec,
+                    offset: stream.append(enc)?,
+                    encoded_length: enc.len() as u32,
+                    decoded_length: decoded.len() as u32,
+                    digest: digest(enc),
+                });
+            }
+            index += n;
+        }
+        Ok(blocks)
+    }
+
+    /// How many blocks to hold in memory at once.
+    ///
+    /// One block per worker is the fastest arrangement. A memory limit lowers
+    /// that, but it cannot go below a single block, because a block is the
+    /// unit compression works on.
+    fn batch_size(&self, block_size: usize) -> usize {
+        let threads = self.options.threads.max(1);
+        match self.options.memory_limit {
+            None => threads,
+            Some(limit) => (limit / block_size.max(1) / 2).clamp(1, threads),
+        }
     }
 }
 
@@ -909,12 +1153,11 @@ impl Builder {
                     },
                 )?;
             } else if meta.is_file() {
-                let content = std::fs::read(&path)?;
                 let link_group = (meta.nlink() > 1).then(|| meta.ino());
-                self.insert(
+                self.insert_tree(
                     &full,
-                    Node::File {
-                        content,
+                    Tree::FileAt {
+                        path: path.clone(),
                         mode,
                         uid: meta.uid(),
                         gid: meta.gid(),

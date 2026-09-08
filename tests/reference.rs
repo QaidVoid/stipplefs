@@ -346,6 +346,7 @@ fn every_writer_option_combination_round_trips() {
                         chunk_average,
                         codecs,
                         threads,
+                        memory_limit: None,
                         level: 3,
                         dictionary_size: 65536,
                         timestamps: stipplefs::write::Timestamps::Clamp,

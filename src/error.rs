@@ -41,6 +41,13 @@ pub enum Error {
         /// What was wrong with it.
         detail: &'static str,
     },
+    /// Temporary space for building an image could not be obtained.
+    Temporary {
+        /// Directory the writer tried to use.
+        directory: String,
+        /// What the operating system reported.
+        detail: String,
+    },
     /// A stored digest did not match the bytes it covers.
     ChecksumMismatch {
         /// What the digest covers.
@@ -83,6 +90,11 @@ impl fmt::Display for Error {
             Error::Unrepresentable { path, detail } => {
                 write!(f, "{path}: {detail}")
             }
+            Error::Temporary { directory, detail } => write!(
+                f,
+                "could not obtain temporary space in {directory}: {detail}; \
+                 set TMPDIR to a writable directory with room for the tree"
+            ),
             Error::ChecksumMismatch { what } => write!(f, "{what} failed its integrity check"),
             Error::Malformed { detail } => write!(f, "malformed image: {detail}"),
             Error::UnsupportedCodec { missing } => write!(

@@ -1,6 +1,7 @@
 //! Builds stipplefs images from a directory tree.
 
 use clap::Parser;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use stipplefs::format::Codec;
@@ -34,6 +35,10 @@ struct Args {
     /// Worker threads. Output does not depend on this.
     #[arg(long, default_value_t = 1)]
     threads: usize,
+    /// Rough ceiling on memory used to compress blocks, in bytes. Cannot go
+    /// below one block. Output does not depend on this.
+    #[arg(long)]
+    memory: Option<usize>,
     /// What to record for modification times. `preserve` keeps each entry's
     /// own time; `zero` records one fixed value, which is what makes two
     /// builds of the same content byte-identical across machines.
@@ -70,6 +75,7 @@ fn run(args: Args) -> Result<(), String> {
             args.dictionary_size
         },
         threads: args.threads.max(1),
+        memory_limit: args.memory,
         timestamps: match args.mtime {
             MtimePolicy::Preserve => Timestamps::Preserve,
             MtimePolicy::Zero => Timestamps::Clamp,
@@ -80,11 +86,25 @@ fn run(args: Args) -> Result<(), String> {
     builder
         .add_tree(&args.source)
         .map_err(|e| format!("reading {}: {e}", args.source.display()))?;
-    let image = builder.build().map_err(|e| e.to_string())?;
-
     // Write beside the target and rename, so a failure leaves no partial image.
     let temp = args.output.with_extension("stipple-partial");
-    std::fs::write(&temp, &image).map_err(|e| format!("writing {}: {e}", temp.display()))?;
+    let written = (|| -> Result<u64, String> {
+        let file =
+            std::fs::File::create(&temp).map_err(|e| format!("writing {}: {e}", temp.display()))?;
+        let mut out = std::io::BufWriter::new(file);
+        builder.build_into(&mut out).map_err(|e| e.to_string())?;
+        out.flush()
+            .map_err(|e| format!("writing {}: {e}", temp.display()))?;
+        let size = out
+            .get_ref()
+            .metadata()
+            .map_err(|e| format!("writing {}: {e}", temp.display()))?
+            .len();
+        Ok(size)
+    })()
+    .inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })?;
     std::fs::rename(&temp, &args.output).map_err(|e| {
         let _ = std::fs::remove_file(&temp);
         format!("renaming into {}: {e}", args.output.display())
@@ -93,7 +113,7 @@ fn run(args: Args) -> Result<(), String> {
     eprintln!(
         "wrote {} ({} bytes) from {}",
         args.output.display(),
-        image.len(),
+        written,
         args.source.display()
     );
     Ok(())

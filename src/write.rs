@@ -598,3 +598,80 @@ impl Builder {
         Ok(image)
     }
 }
+
+#[cfg(feature = "fs")]
+impl Builder {
+    /// Add every entry under `root`, in a canonical order.
+    ///
+    /// Directory entries are sorted before being visited, so the result does
+    /// not depend on the order the underlying filesystem happens to return.
+    /// Files with a link count above one are grouped by their source inode, so
+    /// hard links in the source become hard links in the image.
+    pub fn add_tree(&mut self, root: &std::path::Path) -> Result<()> {
+        self.add_dir(root, &[])
+    }
+
+    fn add_dir(&mut self, dir: &std::path::Path, prefix: &[u8]) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+
+        for path in entries {
+            let name = match path.file_name() {
+                Some(n) => n.as_bytes().to_vec(),
+                None => continue,
+            };
+            let meta = std::fs::symlink_metadata(&path)?;
+            let mode = meta.permissions().mode() & 0o7777;
+
+            let mut full = prefix.to_vec();
+            if !full.is_empty() {
+                full.push(b'/');
+            }
+            full.extend_from_slice(&name);
+
+            if meta.is_dir() {
+                self.insert(
+                    &full,
+                    Node::Directory {
+                        mode,
+                        uid: meta.uid(),
+                        gid: meta.gid(),
+                    },
+                )?;
+                self.add_dir(&path, &full)?;
+            } else if meta.is_symlink() {
+                let target = std::fs::read_link(&path)?;
+                self.insert(
+                    &full,
+                    Node::Symlink {
+                        target: target.as_os_str().as_bytes().to_vec(),
+                        uid: meta.uid(),
+                        gid: meta.gid(),
+                    },
+                )?;
+            } else if meta.is_file() {
+                let content = std::fs::read(&path)?;
+                let link_group = (meta.nlink() > 1).then(|| meta.ino());
+                self.insert(
+                    &full,
+                    Node::File {
+                        content,
+                        mode,
+                        uid: meta.uid(),
+                        gid: meta.gid(),
+                        link_group,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+}

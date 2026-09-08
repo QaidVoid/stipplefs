@@ -458,6 +458,17 @@ impl<'i> Reader<'i> {
         self.names.get(at..at + entry.name_length as usize)
     }
 
+    /// The bytes a symbolic link points at.
+    pub fn symlink_target(&self, ino: u32) -> Option<&[u8]> {
+        let node = self.inode(ino)?;
+        if node.file_type() != Some(FileType::Symlink) {
+            return None;
+        }
+        let at = usize::try_from(node.payload).ok()?;
+        let len = usize::try_from(node.size).ok()?;
+        self.names.get(at..at + len)
+    }
+
     /// Check that a regular file's extents tile it exactly.
     fn check_tiling(&self, inode: &Inode) -> Result<()> {
         if inode.extent_count == 0 {

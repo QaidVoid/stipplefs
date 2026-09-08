@@ -2398,6 +2398,75 @@ mod zstd_tests {
         let mut buf = vec![0u8; 100];
         assert!(r.read(1, 0, &mut buf).is_err());
     }
+
+    /// Rewrite one inode's entry in a parallel array, then repair the section
+    /// and superblock digests so the reader gets as far as the field itself
+    /// rather than stopping at a checksum.
+    fn with_inode_field(field: usize, ino: usize, value: u64) -> Vec<u8> {
+        let mut image = base_fs().build();
+        let (offset, size) = {
+            let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+            let s = img.superblock().section(SectionKind::Inodes);
+            (s.offset as usize, s.size as usize)
+        };
+        let n = {
+            let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+            img.superblock().inode_count as usize
+        };
+        let widths: Vec<u8> = image[offset..offset + 7].to_vec();
+        let width = widths[field] as usize;
+        assert!(width > 0, "array {field} is not present in this fixture");
+        let mut at = offset + INODE_HEADER_SIZE;
+        for w in &widths[..field] {
+            at += n * *w as usize;
+        }
+        at += ino * width;
+        image[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+
+        let end = offset + size;
+        let d = digest(&image[offset..end - 8]).to_le_bytes();
+        image[end - 8..end].copy_from_slice(&d);
+        let sb = digest(&image[..Superblock::CHECKSUM_OFFSET]).to_le_bytes();
+        image[Superblock::CHECKSUM_OFFSET..SUPERBLOCK_SIZE].copy_from_slice(&sb);
+        image
+    }
+
+    #[test]
+    fn an_inode_naming_an_attribute_beyond_the_table_is_refused() {
+        // Field 2 is the attribute index. Pointing it past the table must not
+        // yield somebody else's mode, owner and group.
+        let image = with_inode_field(2, 1, u64::MAX);
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        assert!(
+            r.inode(1).is_none(),
+            "an attribute index past the table resolved to something"
+        );
+        let mut buf = vec![0u8; 10];
+        assert!(r.read(1, 0, &mut buf).is_err());
+    }
+
+    #[test]
+    fn an_inode_naming_extended_attributes_beyond_the_table_is_refused() {
+        let widths = {
+            let image = base_fs().build();
+            let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+            let s = img.superblock().section(SectionKind::Inodes);
+            image[s.offset as usize..s.offset as usize + 7].to_vec()
+        };
+        if widths[5] == 0 {
+            // The fixture carries no extended attributes, so there is no index
+            // to corrupt and nothing to check here.
+            return;
+        }
+        let image = with_inode_field(5, 1, u64::MAX);
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let r = img.reader().unwrap();
+        assert!(
+            r.xattrs(1).is_err() || r.xattrs(1).map(|v| v.is_empty()).unwrap_or(false),
+            "an extended attribute index past the table returned attributes"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "zstd"))]

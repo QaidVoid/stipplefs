@@ -290,3 +290,226 @@ fn a_device_node_round_trips_where_one_can_be_created() {
 
     assert_eq!(before, kinds(&dest), "the device node did not survive");
 }
+
+/// An image holding one of every kind the format defines.
+///
+/// Built through the writer rather than from a tree, so that the kinds a test
+/// machine may not let us create on disk are still covered.
+fn every_kind_image() -> Vec<u8> {
+    use stipplefs::write::{Builder, DeviceKind, Node, Options, SpecialKind};
+
+    let mut b = Builder::new(Options {
+        block_size: 4096,
+        level: 3,
+        ..Options::default()
+    })
+    .unwrap();
+    b.insert(
+        b"dir",
+        Node::Directory {
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        },
+    )
+    .unwrap();
+    b.insert(
+        b"file",
+        Node::File {
+            content: b"hello".to_vec(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            link_group: None,
+        },
+    )
+    .unwrap();
+    b.insert(
+        b"link",
+        Node::Symlink {
+            target: b"file".to_vec(),
+            uid: 0,
+            gid: 0,
+        },
+    )
+    .unwrap();
+    for (name, kind) in [
+        (&b"pipe"[..], SpecialKind::Fifo),
+        (b"sock", SpecialKind::Socket),
+    ] {
+        b.insert(
+            name,
+            Node::Special {
+                kind,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+        )
+        .unwrap();
+    }
+    for (name, kind, rdev) in [
+        (&b"chr"[..], DeviceKind::Char, 0x0103u64),
+        (b"blk", DeviceKind::Block, 0x0800),
+    ] {
+        b.insert(
+            name,
+            Node::Device {
+                kind,
+                rdev,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+            },
+        )
+        .unwrap();
+    }
+    b.build().unwrap()
+}
+
+#[test]
+fn every_kind_reads_back_as_itself() {
+    use stipplefs::format::FileType;
+    use stipplefs::read::Image;
+
+    let image = every_kind_image();
+    let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+    let r = img.reader().unwrap();
+    let root = r.root();
+    for (name, want) in [
+        (&b"dir"[..], FileType::Directory),
+        (b"file", FileType::Regular),
+        (b"link", FileType::Symlink),
+        (b"pipe", FileType::Fifo),
+        (b"sock", FileType::Socket),
+        (b"chr", FileType::CharDevice),
+        (b"blk", FileType::BlockDevice),
+    ] {
+        let shown = String::from_utf8_lossy(name).into_owned();
+        let ino = r
+            .lookup(root, name)
+            .unwrap_or_else(|| panic!("{shown} is missing"));
+        let inode = r
+            .inode(ino)
+            .unwrap_or_else(|| panic!("{shown} has no inode"));
+        assert_eq!(inode.file_type(), Some(want), "{shown} read back wrong");
+    }
+
+    for (name, want) in [(&b"chr"[..], 0x0103u64), (b"blk", 0x0800)] {
+        let shown = String::from_utf8_lossy(name).into_owned();
+        let ino = r.lookup(root, name).unwrap();
+        assert_eq!(
+            r.inode(ino).unwrap().device(),
+            Some(want),
+            "{shown} lost its device number"
+        );
+    }
+    let file = r.lookup(root, b"file").unwrap();
+    assert_eq!(
+        r.inode(file).unwrap().device(),
+        None,
+        "a regular file reported a device number"
+    );
+}
+
+/// Parse the `label count` lines a build prints after its summary.
+fn reported_counts(stderr: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for line in stderr.lines() {
+        let trimmed = line.trim_start();
+        if line == trimmed {
+            continue;
+        }
+        if let Some((label, n)) = trimmed.rsplit_once(char::is_whitespace)
+            && let Ok(n) = n.trim().parse::<u64>()
+        {
+            out.insert(label.trim().to_string(), n);
+        }
+    }
+    out
+}
+
+#[test]
+fn a_build_reports_the_counts_the_source_tree_holds() {
+    let s = Scratch::new("counts");
+    let src = s.path("src");
+    let expected = build_fixture(&src);
+
+    let built = Command::new(MK)
+        .arg(&src)
+        .arg(s.path("out.stipple"))
+        .args(["--block-size", "4096", "--level", "3"])
+        .output()
+        .unwrap();
+    assert!(built.status.success());
+    let reported = reported_counts(&String::from_utf8_lossy(&built.stderr));
+
+    let mut want: BTreeMap<&str, u64> = BTreeMap::new();
+    for kind in expected.values() {
+        let label = match kind.as_str() {
+            "dir" => "directories",
+            "file" => "files",
+            "symlink" => "symlinks",
+            "fifo" => "pipes",
+            "socket" => "sockets",
+            "char" => "char devices",
+            "block" => "block devices",
+            other => panic!("unexpected kind {other}"),
+        };
+        *want.entry(label).or_default() += 1;
+    }
+    // The root is in the image but is not one of the entries under it.
+    *want.entry("directories").or_default() += 1;
+
+    for (label, n) in &want {
+        assert_eq!(
+            reported.get(*label).copied(),
+            Some(*n),
+            "the build reported {:?} for {label}, the tree holds {n}",
+            reported.get(*label)
+        );
+    }
+}
+
+#[test]
+fn inspecting_an_image_of_every_kind_counts_each_one() {
+    let s = Scratch::new("inspect");
+    let image = s.path("all.stipple");
+    std::fs::write(&image, every_kind_image()).unwrap();
+
+    let out = Command::new(ST).arg("check").arg(&image).output().unwrap();
+    assert!(
+        out.status.success(),
+        "check failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    for label in [
+        "directories",
+        "files",
+        "symlinks",
+        "pipes",
+        "sockets",
+        "char devices",
+        "block devices",
+    ] {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(label))
+            .unwrap_or_else(|| panic!("check reported no line for {label}:\n{text}"));
+        let n: u64 = line[label.len()..]
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("could not read a count from {line:?}"));
+        assert!(n > 0, "check reported {n} for {label}");
+    }
+    let per_inode = text
+        .lines()
+        .find(|l| l.contains("per inode"))
+        .unwrap_or_else(|| panic!("check reported no metadata cost:\n{text}"));
+    assert!(
+        !per_inode.contains("0.0 per inode"),
+        "metadata cost per inode was reported as zero: {per_inode}"
+    );
+}

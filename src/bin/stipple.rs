@@ -241,7 +241,8 @@ fn check(located: Located) -> Result<(), String> {
     let mut links = 0u64;
     let mut fifos = 0u64;
     let mut sockets = 0u64;
-    let mut devices = 0u64;
+    let mut char_devices = 0u64;
+    let mut block_devices = 0u64;
     let mut bytes = 0u64;
     let mut checked = 0u64;
     walk(&reader, 0, Path::new(""), &mut |_, ino| {
@@ -251,7 +252,8 @@ fn check(located: Located) -> Result<(), String> {
             Some(FileType::Symlink) => links += 1,
             Some(FileType::Fifo) => fifos += 1,
             Some(FileType::Socket) => sockets += 1,
-            Some(FileType::CharDevice) | Some(FileType::BlockDevice) => devices += 1,
+            Some(FileType::CharDevice) => char_devices += 1,
+            Some(FileType::BlockDevice) => block_devices += 1,
             Some(FileType::Regular) => {
                 files += 1;
                 bytes += node.size;
@@ -288,6 +290,8 @@ fn check(located: Located) -> Result<(), String> {
         ("extents", SectionKind::Extents),
         ("blocks", SectionKind::Blocks),
         ("dictionary", SectionKind::Dictionaries),
+        ("attributes", SectionKind::Attributes),
+        ("xattrs", SectionKind::ExtendedAttributes),
     ];
     let mut metadata = 0u64;
     println!("sections");
@@ -311,7 +315,8 @@ fn check(located: Located) -> Result<(), String> {
     println!("symlinks        {links}");
     println!("pipes           {fifos}");
     println!("sockets         {sockets}");
-    println!("devices         {devices}");
+    println!("char devices    {char_devices}");
+    println!("block devices   {block_devices}");
     println!("verified        {checked} bytes read and checksummed");
     Ok(())
 }

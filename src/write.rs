@@ -169,6 +169,40 @@ enum Tree {
     },
 }
 
+/// How many entries of each kind a builder holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Directories, including the root.
+    pub directories: u64,
+    /// Regular files, counting each name of a hard-linked file.
+    pub files: u64,
+    /// Symbolic links.
+    pub symlinks: u64,
+    /// Named pipes.
+    pub fifos: u64,
+    /// Sockets.
+    pub sockets: u64,
+    /// Character devices.
+    pub char_devices: u64,
+    /// Block devices.
+    pub block_devices: u64,
+}
+
+impl Counts {
+    /// Every kind and its count, in a fixed order suitable for reporting.
+    pub fn by_kind(&self) -> [(&'static str, u64); 7] {
+        [
+            ("directories", self.directories),
+            ("files", self.files),
+            ("symlinks", self.symlinks),
+            ("pipes", self.fifos),
+            ("sockets", self.sockets),
+            ("char devices", self.char_devices),
+            ("block devices", self.block_devices),
+        ]
+    }
+}
+
 /// One extended attribute: a name and a value, both arbitrary bytes.
 pub type Xattr = (Vec<u8>, Vec<u8>);
 
@@ -259,6 +293,45 @@ impl Builder {
             other => Tree::Node(other),
         };
         self.insert_tree(path, entry)
+    }
+
+    /// How many entries of each kind the builder holds.
+    ///
+    /// Counted before building, so a caller can report what went in without
+    /// reading the image back.
+    pub fn counts(&self) -> Counts {
+        fn walk(dir: &Dir, counts: &mut Counts) {
+            counts.directories += 1;
+            for entry in dir.children.values() {
+                match entry {
+                    Tree::Dir(d) => walk(d, counts),
+                    #[cfg(feature = "fs")]
+                    Tree::FileAt { .. } => counts.files += 1,
+                    Tree::Node(Node::File { .. }) => counts.files += 1,
+                    Tree::Node(Node::Symlink { .. }) => counts.symlinks += 1,
+                    Tree::Node(Node::Special {
+                        kind: SpecialKind::Fifo,
+                        ..
+                    }) => counts.fifos += 1,
+                    Tree::Node(Node::Special {
+                        kind: SpecialKind::Socket,
+                        ..
+                    }) => counts.sockets += 1,
+                    Tree::Node(Node::Device {
+                        kind: DeviceKind::Char,
+                        ..
+                    }) => counts.char_devices += 1,
+                    Tree::Node(Node::Device {
+                        kind: DeviceKind::Block,
+                        ..
+                    }) => counts.block_devices += 1,
+                    Tree::Node(Node::Directory { .. }) => {}
+                }
+            }
+        }
+        let mut counts = Counts::default();
+        walk(&self.root, &mut counts);
+        counts
     }
 
     fn insert_tree(&mut self, path: &[u8], entry: Tree) -> Result<()> {

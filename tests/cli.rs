@@ -481,3 +481,30 @@ fn the_preserving_policy_is_still_reproducible() {
     );
     assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
 }
+
+#[test]
+fn the_build_help_names_the_defaults_and_what_reproducibility_costs() {
+    let out = Command::new(MK).arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("--mtime"),
+        "the help does not mention the timestamp policy:\n{help}"
+    );
+    assert!(
+        help.contains("[default: preserve]"),
+        "the help does not name the timestamp default:\n{help}"
+    );
+    assert!(
+        help.contains("byte-identical"),
+        "the help does not say which policy makes two builds identical:\n{help}"
+    );
+    assert!(
+        help.contains("--memory"),
+        "the help does not mention the memory limit:\n{help}"
+    );
+    assert!(
+        help.contains("Cannot go below one block"),
+        "the help does not say what the memory limit cannot do:\n{help}"
+    );
+}

@@ -86,6 +86,8 @@ fn run(args: Args) -> Result<(), String> {
     builder
         .add_tree(&args.source)
         .map_err(|e| format!("reading {}: {e}", args.source.display()))?;
+    let counts = builder.counts();
+
     // Write beside the target and rename, so a failure leaves no partial image.
     let temp = args.output.with_extension("stipple-partial");
     let written = (|| -> Result<u64, String> {
@@ -116,6 +118,11 @@ fn run(args: Args) -> Result<(), String> {
         written,
         args.source.display()
     );
+    for (label, n) in counts.by_kind() {
+        if n > 0 {
+            eprintln!("  {label:<14} {n}");
+        }
+    }
     Ok(())
 }
 

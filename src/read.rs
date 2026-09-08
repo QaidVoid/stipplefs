@@ -3,7 +3,7 @@
 use crate::error::{Error, Result};
 use crate::format::{
     ALIGNMENT, Codec, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, SECTION_COUNT, SUPERBLOCK_SIZE,
-    Section, Superblock, VERSION_MAJOR, supported_codecs,
+    Section, SectionKind, Superblock, VERSION_MAJOR, supported_codecs,
 };
 use crate::source::{ByteSource, Region};
 
@@ -189,6 +189,138 @@ impl Image<'static> {
     pub fn open_at(path: impl AsRef<std::path::Path>, offset: u64, size: u64) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         Image::new(crate::source::FileSource::new(file)?, offset, size)
+    }
+}
+
+/// A metadata section's bytes, borrowed when the source allows it.
+pub type SectionData<'a> = std::borrow::Cow<'a, [u8]>;
+
+/// One entry of the block index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockEntry {
+    /// Where the stored bytes begin, relative to the image.
+    pub image_offset: u64,
+    /// Bytes as stored, excluding the trailing digest.
+    pub stored_length: u32,
+    /// Bytes after decoding.
+    pub decoded_length: u32,
+    /// How the bytes are stored.
+    pub codec: Codec,
+}
+
+/// Size of one block index entry.
+pub const BLOCK_ENTRY_SIZE: usize = 16;
+
+/// The block index, parsed on demand rather than materialised.
+pub struct BlockIndex<'a> {
+    bytes: SectionData<'a>,
+    count: u32,
+}
+
+impl BlockIndex<'_> {
+    /// Number of blocks.
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// Entry `i`, or `None` when `i` is out of range.
+    pub fn get(&self, i: u32) -> Option<BlockEntry> {
+        if i >= self.count {
+            return None;
+        }
+        let at = i as usize * BLOCK_ENTRY_SIZE;
+        let e = self.bytes.get(at..at + BLOCK_ENTRY_SIZE)?;
+        let mut off = [0u8; 8];
+        off.copy_from_slice(&e[0..8]);
+        Some(BlockEntry {
+            image_offset: u64::from_le_bytes(off),
+            stored_length: u32::from_le_bytes([e[8], e[9], e[10], e[11]]),
+            decoded_length: u32::from_le_bytes([e[12], e[13], e[14], 0]),
+            codec: Codec::from_id(e[15])?,
+        })
+    }
+}
+
+impl<'a> Image<'a> {
+    /// Read a metadata section, verifying its digest.
+    ///
+    /// The bytes are borrowed when the underlying source can lend them, so
+    /// metadata is searched in place rather than copied.
+    pub fn section_data(&self, kind: SectionKind) -> Result<SectionData<'_>> {
+        let section = self.superblock.section(kind);
+        if section.is_absent() {
+            return Ok(SectionData::Borrowed(&[]));
+        }
+        if section.size < 8 {
+            return Err(Error::Malformed {
+                detail: "a present section is too short to hold its digest",
+            });
+        }
+        let content_len = section.size - 8;
+
+        let (content, stored) = match self.region.slice(section.offset, section.size) {
+            Some(all) => {
+                let (c, d) = all.split_at(content_len as usize);
+                let mut digest_bytes = [0u8; 8];
+                digest_bytes.copy_from_slice(d);
+                (SectionData::Borrowed(c), u64::from_le_bytes(digest_bytes))
+            }
+            None => {
+                let mut c = vec![0u8; content_len as usize];
+                self.region.read_at(section.offset, &mut c)?;
+                let mut d = [0u8; 8];
+                self.region.read_at(section.offset + content_len, &mut d)?;
+                (SectionData::Owned(c), u64::from_le_bytes(d))
+            }
+        };
+
+        if digest(&content) != stored {
+            return Err(Error::ChecksumMismatch {
+                what: "metadata section",
+            });
+        }
+        Ok(content)
+    }
+
+    /// Read and validate the block index.
+    pub fn block_index(&self) -> Result<BlockIndex<'_>> {
+        let bytes = self.section_data(SectionKind::Blocks)?;
+        let count = self.superblock.block_count;
+        let needed = count as usize * BLOCK_ENTRY_SIZE;
+        if bytes.len() < needed {
+            return Err(Error::Malformed {
+                detail: "block index section is shorter than block_count requires",
+            });
+        }
+        let index = BlockIndex { bytes, count };
+        for i in 0..count {
+            let e = index.get(i).ok_or(Error::Malformed {
+                detail: "a block index entry names a codec the format does not define",
+            })?;
+            if e.decoded_length > self.superblock.block_size {
+                return Err(Error::Malformed {
+                    detail: "a block declares a decoded length larger than block_size",
+                });
+            }
+            if e.codec.bit() & self.superblock.codec_mask == 0 {
+                return Err(Error::Malformed {
+                    detail: "a block uses a codec absent from codec_mask",
+                });
+            }
+            let end = e
+                .image_offset
+                .checked_add(e.stored_length as u64)
+                .and_then(|v| v.checked_add(8))
+                .ok_or(Error::Malformed {
+                    detail: "a block's stored range overflows",
+                })?;
+            if e.image_offset < ALIGNMENT || end > self.superblock.image_length {
+                return Err(Error::Malformed {
+                    detail: "a block's stored bytes lie outside the image",
+                });
+            }
+        }
+        Ok(index)
     }
 }
 
@@ -440,6 +572,108 @@ mod image_tests {
 mod tests_support {
     use super::*;
 
+    /// Lays out a whole image: superblock, 4096-aligned sections each with a
+    /// trailing digest, then a data area.
+    pub struct Builder {
+        pub sections: Vec<(SectionKind, Vec<u8>)>,
+        pub block_count: u32,
+        pub codec_mask: u16,
+        pub block_size: u32,
+        pub data: Vec<u8>,
+    }
+
+    impl Default for Builder {
+        fn default() -> Self {
+            Builder {
+                sections: Vec::new(),
+                block_count: 0,
+                codec_mask: Codec::Stored.bit(),
+                block_size: 65536,
+                data: Vec::new(),
+            }
+        }
+    }
+
+    impl Builder {
+        pub fn section(mut self, kind: SectionKind, content: Vec<u8>) -> Self {
+            self.sections.push((kind, content));
+            self
+        }
+
+        pub fn block_count(mut self, n: u32) -> Self {
+            self.block_count = n;
+            self
+        }
+
+        pub fn codec_mask(mut self, m: u16) -> Self {
+            self.codec_mask = m;
+            self
+        }
+
+        pub fn with_data(mut self, d: Vec<u8>) -> Self {
+            self.data = d;
+            self
+        }
+
+        /// Offset the data area will start at, so callers can point blocks at it.
+        pub fn data_offset(&self) -> u64 {
+            let mut at = 4096u64;
+            for (_, c) in &self.sections {
+                at += (c.len() as u64 + 8).div_ceil(4096) * 4096;
+            }
+            at
+        }
+
+        pub fn build(self) -> Vec<u8> {
+            let mut placed = [(0u64, 0u64); SECTION_COUNT];
+            let mut body: Vec<u8> = Vec::new();
+            let mut at = 4096u64;
+            for (kind, content) in &self.sections {
+                let size = content.len() as u64 + 8;
+                placed[*kind as usize] = (at, size);
+                body.extend_from_slice(content);
+                body.extend_from_slice(&digest(content).to_le_bytes());
+                let pad = size.div_ceil(4096) * 4096 - size;
+                body.extend(std::iter::repeat_n(0u8, pad as usize));
+                at += size + pad;
+            }
+            let data_at = at;
+            body.extend_from_slice(&self.data);
+            at += self.data.len() as u64;
+            let total = at.div_ceil(4096) * 4096;
+            body.extend(std::iter::repeat_n(0u8, (total - at) as usize));
+            let _ = data_at;
+
+            let mut b = [0u8; SUPERBLOCK_SIZE];
+            b[0..8].copy_from_slice(&MAGIC);
+            b[8..10].copy_from_slice(&1u16.to_le_bytes());
+            b[14..16].copy_from_slice(&self.codec_mask.to_le_bytes());
+            b[16..24].copy_from_slice(&total.to_le_bytes());
+            b[32..36].copy_from_slice(&self.block_size.to_le_bytes());
+            b[44..48].copy_from_slice(&self.block_count.to_le_bytes());
+            for (i, (off, size)) in placed.iter().enumerate() {
+                let base = 56 + i * 16;
+                b[base..base + 8].copy_from_slice(&off.to_le_bytes());
+                b[base + 8..base + 16].copy_from_slice(&size.to_le_bytes());
+            }
+            let d = digest(&b[..Superblock::CHECKSUM_OFFSET]);
+            b[Superblock::CHECKSUM_OFFSET..].copy_from_slice(&d.to_le_bytes());
+
+            let mut image = b.to_vec();
+            image.extend_from_slice(&body);
+            image
+        }
+    }
+
+    pub fn block_entry(image_offset: u64, stored: u32, decoded: u32, codec: Codec) -> Vec<u8> {
+        let mut e = Vec::with_capacity(16);
+        e.extend_from_slice(&image_offset.to_le_bytes());
+        e.extend_from_slice(&stored.to_le_bytes());
+        e.extend_from_slice(&decoded.to_le_bytes()[..3]);
+        e.push(codec.id());
+        e
+    }
+
     /// A whole valid image: superblock plus three zero-filled sections.
     pub fn valid_image() -> Vec<u8> {
         let mut b = [0u8; SUPERBLOCK_SIZE];
@@ -458,5 +692,125 @@ mod tests_support {
         let mut image = b.to_vec();
         image.resize(4096 * 4, 0);
         image
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::tests_support::{Builder, block_entry};
+    use super::*;
+
+    fn one_block_image() -> Vec<u8> {
+        let b = Builder::default();
+        let data_at = {
+            let probe = Builder::default().section(SectionKind::Blocks, vec![0u8; 16]);
+            probe.data_offset()
+        };
+        b.section(
+            SectionKind::Blocks,
+            block_entry(data_at, 100, 4096, Codec::Stored),
+        )
+        .block_count(1)
+        .with_data(vec![0xEE; 200])
+        .build()
+    }
+
+    #[test]
+    fn block_index_parses_and_validates() {
+        let image = one_block_image();
+        let opened = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let index = opened.block_index().unwrap();
+        assert_eq!(index.count(), 1);
+        let e = index.get(0).unwrap();
+        assert_eq!(e.stored_length, 100);
+        assert_eq!(e.decoded_length, 4096);
+        assert_eq!(e.codec, Codec::Stored);
+        assert!(index.get(1).is_none());
+    }
+
+    #[test]
+    fn metadata_is_borrowed_from_an_in_memory_source() {
+        let image = one_block_image();
+        let opened = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let data = opened.section_data(SectionKind::Blocks).unwrap();
+        assert!(matches!(data, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn metadata_is_copied_from_a_file_source_and_agrees() {
+        let image = one_block_image();
+        let path = std::env::temp_dir().join("stipplefs-section.img");
+        std::fs::write(&path, &image).unwrap();
+
+        let from_file = Image::open(&path).unwrap();
+        let copied = from_file.section_data(SectionKind::Blocks).unwrap();
+        assert!(matches!(copied, std::borrow::Cow::Owned(_)));
+
+        let in_memory = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let borrowed = in_memory.section_data(SectionKind::Blocks).unwrap();
+        assert_eq!(copied.as_ref(), borrowed.as_ref());
+        assert_eq!(
+            from_file.block_index().unwrap().get(0),
+            in_memory.block_index().unwrap().get(0)
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rejects_a_corrupted_metadata_section() {
+        let mut image = one_block_image();
+        image[4096] ^= 0xff;
+        let opened = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        assert!(matches!(
+            opened.section_data(SectionKind::Blocks),
+            Err(Error::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_decoded_length_larger_than_block_size() {
+        let probe = Builder::default().section(SectionKind::Blocks, vec![0u8; 16]);
+        let at = probe.data_offset();
+        let image = Builder::default()
+            .section(
+                SectionKind::Blocks,
+                block_entry(at, 100, 1 << 20, Codec::Stored),
+            )
+            .block_count(1)
+            .with_data(vec![0xEE; 200])
+            .build();
+        let opened = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        assert!(matches!(opened.block_index(), Err(Error::Malformed { .. })));
+    }
+
+    #[test]
+    fn rejects_a_block_outside_the_image() {
+        let image = Builder::default()
+            .section(
+                SectionKind::Blocks,
+                block_entry(1 << 40, 100, 4096, Codec::Stored),
+            )
+            .block_count(1)
+            .build();
+        let opened = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        assert!(matches!(opened.block_index(), Err(Error::Malformed { .. })));
+    }
+
+    #[test]
+    fn rejects_a_block_whose_codec_is_absent_from_the_mask() {
+        let probe = Builder::default().section(SectionKind::Blocks, vec![0u8; 16]);
+        let at = probe.data_offset();
+        let image = Builder::default()
+            .section(SectionKind::Blocks, block_entry(at, 100, 4096, Codec::Zstd))
+            .block_count(1)
+            .codec_mask(Codec::Stored.bit() | Codec::Zstd.bit())
+            .with_data(vec![0xEE; 200])
+            .build();
+        // codec_mask names zstd, which this build cannot decode, so open fails first
+        assert!(matches!(
+            Image::new(image.clone(), 0, image.len() as u64),
+            Err(Error::UnsupportedCodec { .. })
+        ));
     }
 }

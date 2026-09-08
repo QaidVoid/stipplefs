@@ -77,26 +77,6 @@ impl Mount {
             flags: 0,
         }
     }
-
-    fn find(&self, parent: u32, name: &[u8]) -> Option<u32> {
-        let dir = self.reader.inode(parent)?;
-        if dir.file_type() != Some(OurType::Directory) {
-            return None;
-        }
-        let first = u32::try_from(dir.payload).ok()?;
-        let mut lo = 0u32;
-        let mut hi = u32::try_from(dir.size).ok()?;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let entry = self.reader.dirent(first + mid)?;
-            match self.reader.name(entry)?.cmp(name) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Some(entry.inode),
-            }
-        }
-        None
-    }
 }
 
 impl Filesystem for Mount {
@@ -106,7 +86,8 @@ impl Filesystem for Mount {
             return;
         };
         match self
-            .find(parent, name.as_bytes())
+            .reader
+            .lookup(parent, name.as_bytes())
             .and_then(|ino| self.reader.inode(ino).map(|n| (ino, n)))
         {
             Some((ino, node)) => reply.entry(&FOREVER, &self.attr(ino, &node), Generation(0)),

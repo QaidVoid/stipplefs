@@ -23,7 +23,7 @@ fn u64at(b: &[u8; SUPERBLOCK_SIZE], off: usize) -> u64 {
 }
 
 /// Digest used everywhere in the format.
-pub fn digest(bytes: &[u8]) -> u64 {
+pub(crate) fn digest(bytes: &[u8]) -> u64 {
     twox_hash::XxHash3_64::oneshot(bytes)
 }
 
@@ -31,7 +31,10 @@ pub fn digest(bytes: &[u8]) -> u64 {
 ///
 /// `available` is the number of bytes the caller said the image occupies. The
 /// superblock's own `image_length` may not exceed it.
-pub fn parse_superblock(bytes: &[u8; SUPERBLOCK_SIZE], available: u64) -> Result<Superblock> {
+pub(crate) fn parse_superblock(
+    bytes: &[u8; SUPERBLOCK_SIZE],
+    available: u64,
+) -> Result<Superblock> {
     if bytes[..8] != MAGIC {
         return Err(Error::BadMagic);
     }
@@ -169,11 +172,6 @@ impl<'a> Image<'a> {
     /// The validated superblock.
     pub fn superblock(&self) -> &Superblock {
         &self.superblock
-    }
-
-    /// The region the image occupies.
-    pub fn region(&self) -> &Region<'a> {
-        &self.region
     }
 }
 
@@ -481,6 +479,87 @@ impl<'i> Reader<'i> {
         let at = usize::try_from(node.payload).ok()?;
         let len = usize::try_from(node.size).ok()?;
         self.names.get(at..at + len)
+    }
+
+    /// Find a child of `dir` by name.
+    ///
+    /// Directory entries are sorted by name, so this is a binary search.
+    pub fn lookup(&self, dir: u32, name: &[u8]) -> Option<u32> {
+        let node = self.inode(dir)?;
+        if node.file_type() != Some(FileType::Directory) {
+            return None;
+        }
+        let first = u32::try_from(node.payload).ok()?;
+        let mut lo = 0u32;
+        let mut hi = u32::try_from(node.size).ok()?;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let entry = self.dirent(first + mid)?;
+            match self.name(entry)?.cmp(name) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(entry.inode),
+            }
+        }
+        None
+    }
+
+    /// Resolve a slash separated path from the root.
+    ///
+    /// An empty path, or one made only of separators, resolves to the root.
+    pub fn resolve(&self, path: &[u8]) -> Option<u32> {
+        let mut ino = self.root();
+        for part in path.split(|&b| b == b'/') {
+            if part.is_empty() || part == b"." {
+                continue;
+            }
+            ino = self.lookup(ino, part)?;
+        }
+        Some(ino)
+    }
+
+    /// The root directory's inode number.
+    pub fn root(&self) -> u32 {
+        self.superblock.root_inode
+    }
+
+    /// The entries of a directory, in name order.
+    pub fn entries(&self, dir: u32) -> impl Iterator<Item = (&[u8], u32)> + '_ {
+        let node = self
+            .inode(dir)
+            .filter(|n| n.file_type() == Some(FileType::Directory));
+        let first = node.map_or(0, |n| n.payload as u32);
+        let count = node.map_or(0, |n| n.size as u32);
+        (0..count).filter_map(move |i| {
+            let entry = self.dirent(first + i)?;
+            Some((self.name(entry)?, entry.inode))
+        })
+    }
+
+    /// Read a whole file.
+    ///
+    /// Prefer [`Reader::read`] when only part of a file is wanted; this exists
+    /// for the common case of small files.
+    pub fn read_all(&self, ino: u32) -> Result<Vec<u8>> {
+        let node = self.inode(ino).ok_or(Error::Malformed {
+            detail: "read of an inode that does not exist",
+        })?;
+        let mut out = vec![
+            0u8;
+            usize::try_from(node.size).map_err(|_| Error::Malformed {
+                detail: "file is larger than this platform can address",
+            })?
+        ];
+        let mut at = 0usize;
+        while at < out.len() {
+            let n = self.read(ino, at as u64, &mut out[at..])?;
+            if n == 0 {
+                break;
+            }
+            at += n;
+        }
+        out.truncate(at);
+        Ok(out)
     }
 
     /// Check that a regular file's extents tile it exactly.

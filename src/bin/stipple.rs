@@ -78,19 +78,14 @@ fn walk(
     prefix: &Path,
     visit: &mut impl FnMut(&Path, u32) -> Result<(), String>,
 ) -> Result<(), String> {
-    let node = r.inode(ino).ok_or("inode out of range")?;
-    if node.file_type() != Some(FileType::Directory) {
-        return Ok(());
-    }
-    for i in 0..node.size as u32 {
-        let entry = r
-            .dirent(node.payload as u32 + i)
-            .ok_or("dirent out of range")?;
-        let name = r.name(entry).ok_or("name out of range")?;
-        let name = String::from_utf8_lossy(name).into_owned();
+    let children: Vec<(String, u32)> = r
+        .entries(ino)
+        .map(|(name, child)| (String::from_utf8_lossy(name).into_owned(), child))
+        .collect();
+    for (name, child) in children {
         let path = prefix.join(&name);
-        visit(&path, entry.inode)?;
-        walk(r, entry.inode, &path, visit)?;
+        visit(&path, child)?;
+        walk(r, child, &path, visit)?;
     }
     Ok(())
 }

@@ -142,7 +142,7 @@ fn evict_for(inner: &mut Inner, incoming: usize, budget: usize) {
 }
 
 /// Raised when a caller asks for a budget that cannot hold a single block.
-pub fn check_budget(budget: usize, block_size: usize) -> Result<()> {
+pub(crate) fn check_budget(budget: usize, block_size: usize) -> Result<()> {
     if budget < block_size {
         return Err(Error::Malformed {
             detail: "cache budget is smaller than one block",

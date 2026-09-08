@@ -37,6 +37,9 @@ pub struct Metrics {
     pub digest_ns: AtomicU64,
     /// Nanoseconds copying decoded bytes into the caller's buffer.
     pub copy_ns: AtomicU64,
+    /// Nanoseconds inside the block cache, covering the wait for another
+    /// reader, the decode itself and the bookkeeping around it.
+    pub fetch_ns: AtomicU64,
     /// Nanoseconds resolving an offset to an extent and block.
     pub resolve_ns: AtomicU64,
 }
@@ -70,6 +73,11 @@ impl Metrics {
             ("digest", g(&self.digest_ns)),
             ("decode", g(&self.decode_ns)),
             ("copy", g(&self.copy_ns)),
+            (
+                "fetch overhead",
+                g(&self.fetch_ns)
+                    .saturating_sub(g(&self.source_ns) + g(&self.decode_ns) + g(&self.digest_ns)),
+            ),
         ];
         let total: u64 = phases.iter().map(|(_, n)| *n).sum::<u64>().max(1);
 

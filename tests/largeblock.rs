@@ -107,3 +107,77 @@ fn a_cache_too_small_for_the_working_set_decodes_repeatedly() {
          decodes for {blocks} blocks"
     );
 }
+
+#[test]
+fn a_large_block_costs_little_beyond_decoding_it() {
+    // The cache once copied every decoded block into a second allocation on
+    // its way into an `Arc`. That copy is invisible next to a small block and
+    // costs more than the decode itself on a large one, so what this pins down
+    // is the cost the cache adds on top of the work that has to happen.
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let block = 1 << 22; // 4 MiB
+    let image = image_with_blocks(block, 64, 1 << 20);
+    let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+    let blocks = img.block_index().unwrap().count();
+    let r = img
+        .reader_with_budget((blocks as usize + 2) * block as usize)
+        .unwrap();
+
+    for ino in 1..=64u32 {
+        let want = r.inode(ino).unwrap().size as usize;
+        let mut buf = vec![0u8; want];
+        r.read(ino, 0, &mut buf).unwrap();
+    }
+
+    let m = r.metrics();
+    let decode = m.decode_ns.load(Relaxed);
+    let necessary = decode + m.source_ns.load(Relaxed) + m.digest_ns.load(Relaxed);
+    let overhead = m.fetch_ns.load(Relaxed).saturating_sub(necessary);
+    assert!(decode > 0, "the test decoded nothing");
+    assert!(
+        overhead * 4 < decode,
+        "fetching a block cost {overhead} ns beyond the {decode} ns of decoding it, \
+         over {blocks} blocks of {} MiB",
+        block >> 20
+    );
+}
+
+#[test]
+fn bulk_reading_costs_what_it_decodes_at_either_block_size() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // The same content twice, differing only in how it is cut into blocks.
+    // Given a cache able to hold the working set, a large block should cost no
+    // more per decoded byte than a small one, and in fact less, since the
+    // fixed cost of a block is spread over more bytes. A cost per byte that
+    // rises with the block size would mean large blocks are paying for
+    // something other than the volume they decode.
+    let mut rates = Vec::new();
+    for block in [1u32 << 16, 1 << 22] {
+        let image = image_with_blocks(block, 64, 1 << 20);
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let blocks = img.block_index().unwrap().count() as usize;
+        let r = img
+            .reader_with_budget((blocks + 2) * block as usize)
+            .unwrap();
+        for ino in 1..=64u32 {
+            let want = r.inode(ino).unwrap().size as usize;
+            let mut buf = vec![0u8; want];
+            r.read(ino, 0, &mut buf).unwrap();
+        }
+        let m = r.metrics();
+        let decoded = m.cache_misses.load(Relaxed) * block as u64;
+        let ns = m.fetch_ns.load(Relaxed);
+        assert!(decoded > 0, "nothing was decoded at block size {block}");
+        rates.push((block, ns as f64 / decoded as f64));
+    }
+    let (small_block, small) = rates[0];
+    let (large_block, large) = rates[1];
+    assert!(
+        large < small * 1.25,
+        "a {large_block} byte block cost {large:.4} ns per decoded byte against \
+         {small:.4} for a {small_block} byte block, so the per-byte cost grows \
+         with the size of the block"
+    );
+}

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 struct Slot {
-    bytes: Arc<[u8]>,
+    bytes: Arc<Vec<u8>>,
     /// Tick at which this block was last wanted.
     used_at: u64,
 }
@@ -98,7 +98,7 @@ impl BlockCache {
     /// The lock is released while decoding, so different blocks proceed in
     /// parallel. A failed decode wakes every waiter and leaves no entry, so a
     /// later call may retry.
-    pub fn get_or_decode<F>(&self, index: u32, decode: F) -> Result<Arc<[u8]>>
+    pub fn get_or_decode<F>(&self, index: u32, decode: F) -> Result<Arc<Vec<u8>>>
     where
         F: FnOnce() -> Result<Vec<u8>>,
     {
@@ -129,7 +129,10 @@ impl BlockCache {
         };
         self.decodes.fetch_add(1, Ordering::Relaxed);
         let decoded = decode()?;
-        let bytes: Arc<[u8]> = Arc::from(decoded);
+        // `Arc::from(vec)` would copy the block into a second allocation.
+        // For a large block that copy, and faulting in the pages behind it,
+        // cost more than decoding.
+        let bytes = Arc::new(decoded);
 
         let mut inner = self.lock();
         inner.decoding.retain(|&i| i != index);

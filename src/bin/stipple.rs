@@ -20,6 +20,20 @@ struct Args {
 enum Command {
     /// Report an image's structure and verify its integrity.
     Check(Located),
+    /// Mount an image on a directory.
+    #[cfg(feature = "mount")]
+    Mount {
+        #[command(flatten)]
+        image: Located,
+        /// Directory to mount on.
+        mountpoint: PathBuf,
+        /// Let other users see the mount.
+        #[arg(long)]
+        allow_other: bool,
+        /// Event loop threads serving the mount.
+        #[arg(long, default_value_t = 4)]
+        threads: usize,
+    },
     /// Write an image's contents to a directory.
     Extract {
         #[command(flatten)]
@@ -198,10 +212,48 @@ fn extract(located: Located, destination: PathBuf, subtree: Option<String>) -> R
     Ok(())
 }
 
+#[cfg(feature = "mount")]
+fn mount(
+    located: Located,
+    mountpoint: PathBuf,
+    allow_other: bool,
+    threads: usize,
+) -> Result<(), String> {
+    use fuser::{Config, MountOption, SessionACL};
+
+    let budget = located.cache_budget;
+    let image = located.open()?;
+    let fs = stipplefs::mount::Mount::new(image, budget).map_err(|e| e.to_string())?;
+
+    let mut config = Config::default();
+    config.mount_options = vec![
+        MountOption::RO,
+        MountOption::FSName("stipplefs".into()),
+        MountOption::Subtype("stipplefs".into()),
+        MountOption::NoAtime,
+    ];
+    config.acl = if allow_other {
+        SessionACL::All
+    } else {
+        SessionACL::Owner
+    };
+    config.n_threads = Some(threads.max(1));
+    config.clone_fd = threads > 1;
+    eprintln!("mounted on {}, interrupt to unmount", mountpoint.display());
+    fuser::mount(fs, &mountpoint, &config).map_err(|e| format!("mounting: {e}"))
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let outcome = match args.command {
         Command::Check(located) => check(located),
+        #[cfg(feature = "mount")]
+        Command::Mount {
+            image,
+            mountpoint,
+            allow_other,
+            threads,
+        } => mount(image, mountpoint, allow_other, threads),
         Command::Extract {
             image,
             destination,

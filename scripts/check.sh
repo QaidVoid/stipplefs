@@ -26,7 +26,7 @@ gate "clippy all"         cargo clippy --all-features --all-targets --quiet -- -
 gate "clippy read"        cargo clippy --no-default-features --features read --all-targets --quiet -- -D warnings
 gate "clippy write"       cargo clippy --no-default-features --features write --all-targets --quiet -- -D warnings
 gate "tests all"          cargo test --all-features --quiet
-gate "tests full"         cargo test --no-default-features --features read,write,cli,zstd,dict,fs,mmap --quiet
+gate "tests full"         cargo test --no-default-features --features read,write,cli,mount,zstd,dict,fs,mmap --quiet
 gate "tests read"         cargo test --no-default-features --features read --quiet
 gate "docs"               env RUSTDOCFLAGS=-Dwarnings cargo doc --all-features --no-deps --quiet
 gate "feature matrix"     ./scripts/feature-matrix.sh

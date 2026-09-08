@@ -328,10 +328,24 @@ impl<'a> Image<'a> {
 /// Default bytes of decoded blocks a reader may retain.
 ///
 /// A budget below the working set is a performance cliff rather than a gentle
-/// slowdown: a walk in path order will evict and re-decode continuously. The
+/// slowdown: a walk in path order evicts and re-decodes continuously. The
 /// default holds a few hundred blocks at the default block size, which does
 /// not thrash a typical tree. Raise it for large working sets, lower it only
 /// when memory is scarcer than time.
+///
+/// The budget bounds the cache, not the process. Resident memory is the
+/// metadata, plus the cache, plus a constant for per-thread buffers. Measured
+/// on a mount of `/usr/include`, reading six hundred files:
+///
+/// ```text
+/// budget     4 MiB : idle 3,796 kB, peak 15,676 kB
+/// budget    32 MiB : idle 3,876 kB, peak 25,264 kB
+/// budget   256 MiB : idle 3,904 kB, peak 25,212 kB
+/// ```
+///
+/// Idle memory does not move with the budget, because it is the metadata
+/// floor. Peak memory rises with the budget and then stops once the working
+/// set fits, which is why the largest budget buys nothing over the default.
 pub const DEFAULT_CACHE_BUDGET: usize = 32 << 20;
 
 /// The decoded bytes of a block.

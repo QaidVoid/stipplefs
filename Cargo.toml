@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"], optional = true }
+fuser = { version = "0.18.0", default-features = false, optional = true }
 memmap2 = { version = "0.9.11", optional = true }
 twox-hash = { version = "2.1.4", default-features = false, optional = true }
 zstd = { version = "0.14.0", default-features = false, optional = true }
@@ -16,7 +17,7 @@ read = ["dep:twox-hash", "twox-hash/xxhash3_64"]
 write = ["dep:twox-hash", "twox-hash/xxhash3_64", "twox-hash/xxhash3_128"]
 cli = ["dep:clap", "fs"]
 fs = []
-mount = ["read"]
+mount = ["dep:fuser", "read", "fs"]
 mmap = ["dep:memmap2", "fs", "read"]
 zstd = ["dep:zstd"]
 dict = ["zstd", "zstd/zdict_builder"]

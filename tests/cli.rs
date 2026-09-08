@@ -334,3 +334,35 @@ fn hard_links_survive_a_round_trip() {
     assert_eq!(a, b, "hard links must share an inode through the tools");
     assert!(r.inode(a).unwrap().nlink >= 2);
 }
+
+#[test]
+fn source_timestamps_do_not_affect_the_image() {
+    let s = Scratch::new("timestamps");
+    let src = s.path("src");
+    make_tree(&src);
+
+    let first = s.path("first.stipple");
+    assert!(build_image(&src, &first, &[]).status.success());
+
+    // Move every timestamp well into the past. The format records none of
+    // them, so the bytes must not move either.
+    let out = Command::new("find")
+        .arg(&src)
+        .args(["-exec", "touch", "-d", "2001-02-03 04:05:06", "{}", "+"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let second = s.path("second.stipple");
+    assert!(build_image(&src, &second, &[]).status.success());
+
+    assert_eq!(
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&second).unwrap(),
+        "changing source timestamps changed the image"
+    );
+}

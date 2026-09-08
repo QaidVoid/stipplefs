@@ -7,7 +7,11 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-FEATURES=(read write cli mount)
+# Derived from Cargo.toml so the matrix cannot drift behind the manifest.
+mapfile -t FEATURES < <(
+    sed -n '/^\[features\]/,/^\[/p' Cargo.toml |
+        grep -E '^[a-z0-9_-]+ *=' | cut -d= -f1 | tr -d ' ' | grep -v '^default$'
+)
 export RUSTFLAGS="-D warnings"
 
 fail=0

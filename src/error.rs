@@ -18,6 +18,30 @@ pub enum Error {
         /// Number of bytes the source holds.
         available: u64,
     },
+    /// The image does not begin with the expected magic bytes.
+    BadMagic,
+    /// The image uses a major format version this build does not implement.
+    UnsupportedVersion {
+        /// Major version found in the image.
+        major: u16,
+        /// Major version this build implements.
+        supported: u16,
+    },
+    /// A stored digest did not match the bytes it covers.
+    ChecksumMismatch {
+        /// What the digest covers.
+        what: &'static str,
+    },
+    /// A recorded field holds a value the format does not permit.
+    Malformed {
+        /// What is wrong.
+        detail: &'static str,
+    },
+    /// The image uses a codec this build cannot decode.
+    UnsupportedCodec {
+        /// Bitmask of the codecs the image needs but this build lacks.
+        missing: u16,
+    },
     /// The underlying byte source failed.
     Io(std::io::Error),
 }
@@ -32,6 +56,17 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "read of {len} bytes at offset {offset} extends past the end of a {available} byte source"
+            ),
+            Error::BadMagic => write!(f, "not a stipplefs image: magic bytes do not match"),
+            Error::UnsupportedVersion { major, supported } => write!(
+                f,
+                "image format version {major} is not supported by this build, which implements version {supported}"
+            ),
+            Error::ChecksumMismatch { what } => write!(f, "{what} failed its integrity check"),
+            Error::Malformed { detail } => write!(f, "malformed image: {detail}"),
+            Error::UnsupportedCodec { missing } => write!(
+                f,
+                "image uses codecs this build cannot decode (missing mask {missing:#06x})"
             ),
             Error::Io(e) => write!(f, "byte source failed: {e}"),
         }

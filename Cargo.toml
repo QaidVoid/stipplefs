@@ -8,10 +8,11 @@ license = "MIT OR Apache-2.0"
 twox-hash = { version = "2.1.4", default-features = false, optional = true }
 
 [features]
-default = ["read", "write"]
+default = ["read", "write", "fs"]
 read = ["dep:twox-hash", "twox-hash/xxhash3_64"]
 write = ["dep:twox-hash", "twox-hash/xxhash3_64", "twox-hash/xxhash3_128"]
 cli = []
+fs = []
 mount = ["read"]
 
 [[bin]]

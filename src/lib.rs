@@ -8,6 +8,10 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod format;
+
+#[cfg(feature = "read")]
+pub mod read;
 
 #[cfg(feature = "read")]
 pub mod source;

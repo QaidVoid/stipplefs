@@ -144,11 +144,13 @@ impl<'a> Region<'a> {
 }
 
 /// A byte source backed by an open file.
+#[cfg(feature = "fs")]
 pub struct FileSource {
     file: std::fs::File,
     size: u64,
 }
 
+#[cfg(feature = "fs")]
 impl FileSource {
     /// Wrap an already-open file.
     pub fn new(file: std::fs::File) -> Result<Self> {
@@ -157,6 +159,7 @@ impl FileSource {
     }
 }
 
+#[cfg(feature = "fs")]
 impl ByteSource for FileSource {
     fn size(&self) -> u64 {
         self.size
@@ -233,6 +236,7 @@ mod tests {
         assert!(region.slice(490, 16).is_none());
     }
 
+    #[cfg(feature = "fs")]
     #[test]
     fn file_and_memory_sources_agree() {
         let data = corpus();

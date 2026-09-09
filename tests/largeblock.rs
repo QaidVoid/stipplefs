@@ -181,3 +181,162 @@ fn bulk_reading_costs_what_it_decodes_at_either_block_size() {
          with the size of the block"
     );
 }
+
+/// Reads that walk a file from start to end, in `step` sized pieces.
+#[cfg(feature = "metrics")]
+fn stream_file(r: &stipplefs::read::Reader<'_>, ino: u32, step: usize) {
+    let size = r.inode(ino).unwrap().size;
+    let mut at = 0u64;
+    let mut buf = vec![0u8; step];
+    while at < size {
+        let n = r.read(ino, at, &mut buf).unwrap();
+        assert!(n > 0);
+        at += n as u64;
+    }
+}
+
+#[test]
+fn a_streamed_file_is_recognised_and_kept_only_at_low_priority() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let block = 1 << 16;
+    let image = image_with_blocks(block, 8, 4 << 20);
+    let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+    let blocks = img.block_index().unwrap().count() as usize;
+    // A budget with room for every block, so nothing forces an eviction.
+    let r = img
+        .reader_with_budget((blocks + 2) * block as usize)
+        .unwrap();
+
+    stream_file(&r, 1, 4096);
+
+    let m = r.metrics();
+    assert!(
+        m.sequential_runs.load(Relaxed) > 0,
+        "streaming a file start to end was not recognised as a run"
+    );
+    let streamed = m.streamed_blocks.load(Relaxed);
+    assert!(
+        streamed > 0,
+        "a recognised run fetched no blocks without retaining them"
+    );
+    assert!(
+        r.cache_used() < streamed as usize * block as usize,
+        "the cache kept {} bytes of the {} it streamed through",
+        r.cache_used(),
+        streamed as usize * block as usize
+    );
+}
+
+#[test]
+fn scattered_reads_are_not_taken_for_a_run() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let block = 1 << 16;
+    let image = image_with_blocks(block, 24, 1 << 20);
+    let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+    let r = img.reader_with_budget(64 * block as usize).unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    for round in 0..8u64 {
+        for ino in 1..=24u32 {
+            let size = r.inode(ino).unwrap().size;
+            let at = (round * 7919 + ino as u64 * 104729) % (size - 4096);
+            r.read(ino, at, &mut buf).unwrap();
+        }
+    }
+    assert_eq!(
+        r.metrics().sequential_runs.load(Relaxed),
+        0,
+        "reads at unrelated offsets were mistaken for a sequential run"
+    );
+}
+
+#[test]
+fn recognition_does_not_change_what_a_read_returns() {
+    let block = 1 << 16;
+    let image = image_with_blocks(block, 4, 1 << 20);
+    let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+    let r = img.reader_with_budget(64 * block as usize).unwrap();
+
+    let size = r.inode(1).unwrap().size as usize;
+    let mut forwards = vec![0u8; size];
+    let mut at = 0usize;
+    while at < size {
+        let n = r.read(1, at as u64, &mut forwards[at..]).unwrap();
+        at += n;
+    }
+
+    // The same bytes gathered back to front, which is never recognised.
+    let mut backwards = vec![0u8; size];
+    let step = 4096;
+    let mut start = size.saturating_sub(step);
+    loop {
+        let end = (start + step).min(size);
+        let mut piece = vec![0u8; end - start];
+        let mut got = 0;
+        while got < piece.len() {
+            let n = r.read(1, (start + got) as u64, &mut piece[got..]).unwrap();
+            got += n;
+        }
+        backwards[start..end].copy_from_slice(&piece);
+        if start == 0 {
+            break;
+        }
+        start = start.saturating_sub(step);
+    }
+    assert_eq!(forwards, backwards, "reading order changed the bytes");
+}
+
+#[test]
+fn streaming_does_not_evict_a_working_set() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // A budget that holds the working set with room to spare, but nowhere near
+    // the large file streamed alongside it.
+    let block = 1 << 16;
+    let image = image_with_blocks(block, 40, 1 << 20);
+    let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+    let r = img.reader_with_budget(48 * block as usize).unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let mut working_set = || {
+        for ino in 1..=8u32 {
+            r.read(ino, 0, &mut buf).unwrap();
+        }
+    };
+
+    working_set();
+    let warm = r.metrics().cache_misses.load(Relaxed);
+    working_set();
+    let settled = r.metrics().cache_misses.load(Relaxed);
+    assert_eq!(settled, warm, "the working set did not settle in the cache");
+
+    stream_file(&r, 40, 4096);
+    let streamed = r.metrics().cache_misses.load(Relaxed);
+
+    working_set();
+    let after = r.metrics().cache_misses.load(Relaxed);
+    assert_eq!(
+        after,
+        streamed,
+        "streaming a large file cost the working set {} decodes",
+        after - streamed
+    );
+}
+#[test]
+fn streaming_decodes_each_block_once() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let block = 1 << 16;
+    let image = image_with_blocks(block, 4, 4 << 20);
+    let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+    let r = img.reader_with_budget(64 * block as usize).unwrap();
+    let size = r.inode(1).unwrap().size;
+    let spans = size.div_ceil(block as u64);
+    stream_file(&r, 1, 4096);
+    let misses = r.metrics().cache_misses.load(Relaxed);
+    assert!(
+        misses <= spans + 2,
+        "streaming a file spanning {spans} blocks decoded {misses} times"
+    );
+}

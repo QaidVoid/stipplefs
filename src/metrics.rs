@@ -37,6 +37,16 @@ pub struct Metrics {
     pub digest_ns: AtomicU64,
     /// Nanoseconds copying decoded bytes into the caller's buffer.
     pub copy_ns: AtomicU64,
+    /// Times a run of contiguous reads was first recognised as sequential.
+    pub sequential_runs: AtomicU64,
+    /// Reads that continued an already recognised run, meaning the prediction
+    /// that the run would go on held.
+    pub sequential_continued: AtomicU64,
+    /// Times a recognised run was ended by a read that did not continue it.
+    pub sequential_broken: AtomicU64,
+    /// Blocks fetched to serve a recognised run, which the cache does not
+    /// retain.
+    pub streamed_blocks: AtomicU64,
     /// Nanoseconds inside the block cache, covering the wait for another
     /// reader, the decode itself and the bookkeeping around it.
     pub fetch_ns: AtomicU64,

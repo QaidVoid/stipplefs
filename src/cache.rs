@@ -12,14 +12,17 @@ struct Slot {
     bytes: Arc<Vec<u8>>,
     /// Tick at which this block was last wanted.
     used_at: u64,
+    /// Lower classes are dropped first. A block served to a sequential run is
+    /// read once, so it is worth keeping only until something else needs room.
+    class: u8,
 }
 
 #[derive(Default)]
 struct Inner {
     ready: HashMap<u32, Slot>,
-    /// Cached blocks keyed by the tick they were last wanted at, so that the
-    /// least recently wanted one is the first entry rather than a search.
-    order: BTreeMap<u64, u32>,
+    /// Cached blocks keyed by class and then by the tick they were last
+    /// wanted at, so the first entry is the best one to drop.
+    order: BTreeMap<(u8, u64), u32>,
     decoding: Vec<u32>,
     used: usize,
     clock: u64,
@@ -111,7 +114,12 @@ impl BlockCache {
     /// The lock is released while decoding, so different blocks proceed in
     /// parallel. A failed decode wakes every waiter and leaves no entry, so a
     /// later call may retry.
-    pub fn get_or_decode<F>(&self, index: u32, decode: F) -> Result<Arc<Vec<u8>>>
+    /// Fetch a block, decoding it if no other caller already is.
+    ///
+    /// `streaming` marks a block wanted by a run of contiguous reads. Such a
+    /// block is still cached, since consecutive reads land inside it, but it
+    /// is dropped before anything a random reader is using.
+    pub fn get_or_decode<F>(&self, index: u32, streaming: bool, decode: F) -> Result<Arc<Vec<u8>>>
     where
         F: FnOnce() -> Result<Vec<u8>>,
     {
@@ -120,14 +128,16 @@ impl BlockCache {
             if let Some((was, bytes)) = inner
                 .ready
                 .get(&index)
-                .map(|slot| (slot.used_at, Arc::clone(&slot.bytes)))
+                .map(|slot| ((slot.class, slot.used_at), Arc::clone(&slot.bytes)))
             {
                 let now = inner.tick();
+                let class = class_of(streaming);
                 if let Some(slot) = inner.ready.get_mut(&index) {
                     slot.used_at = now;
+                    slot.class = class;
                 }
                 inner.order.remove(&was);
-                inner.order.insert(now, index);
+                inner.order.insert((class, now), index);
                 return Ok(bytes);
             }
             if inner.decoding.contains(&index) {
@@ -163,21 +173,33 @@ impl BlockCache {
                 Ordering::Relaxed,
             );
             let now = inner.tick();
+            let class = class_of(streaming);
             let slot = Slot {
                 bytes: Arc::clone(&bytes),
                 used_at: now,
+                class,
             };
             if let Some(previous) = inner.ready.insert(index, slot) {
-                inner.order.remove(&previous.used_at);
+                inner.order.remove(&(previous.class, previous.used_at));
                 inner.used -= previous.bytes.len();
             }
             inner.used += bytes.len();
-            inner.order.insert(now, index);
+            inner.order.insert((class, now), index);
         }
         drop(inner);
         self.changed.notify_all();
         Ok(bytes)
     }
+}
+
+/// Blocks a sequential run wanted, which are dropped before anything else.
+const STREAMED: u8 = 0;
+
+/// Blocks a reader may want again.
+const RETAINED: u8 = 1;
+
+fn class_of(streaming: bool) -> u8 {
+    if streaming { STREAMED } else { RETAINED }
 }
 
 /// Drop least recently wanted blocks until `incoming` more bytes fit.
@@ -224,8 +246,8 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![7u8; 64])
         };
-        let a = cache.get_or_decode(0, decode).unwrap();
-        let b = cache.get_or_decode(0, decode).unwrap();
+        let a = cache.get_or_decode(0, false, decode).unwrap();
+        let b = cache.get_or_decode(0, false, decode).unwrap();
         assert_eq!(a.as_ref(), b.as_ref());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -246,7 +268,7 @@ mod tests {
             let release = Arc::clone(&release_rx);
             handles.push(std::thread::spawn(move || {
                 cache
-                    .get_or_decode(0, || {
+                    .get_or_decode(0, false, || {
                         calls.fetch_add(1, Ordering::SeqCst);
                         entered.send(()).unwrap();
                         let _ = release.lock().unwrap().recv_timeout(Duration::from_secs(5));
@@ -281,7 +303,7 @@ mod tests {
             let release = Arc::clone(&release_rx);
             handles.push(std::thread::spawn(move || {
                 cache
-                    .get_or_decode(index, || {
+                    .get_or_decode(index, false, || {
                         entered.send(index).unwrap();
                         let _ = release.lock().unwrap().recv_timeout(Duration::from_secs(5));
                         Ok(vec![index as u8; 32])
@@ -305,14 +327,14 @@ mod tests {
     #[test]
     fn a_failed_decode_wakes_waiters_and_can_be_retried() {
         let cache = Arc::new(BlockCache::new(1 << 20));
-        let r = cache.get_or_decode(3, || {
+        let r = cache.get_or_decode(3, false, || {
             Err(Error::Malformed {
                 detail: "decode failed",
             })
         });
         assert!(r.is_err());
         assert_eq!(cache.used(), 0);
-        let ok = cache.get_or_decode(3, || Ok(vec![1u8; 16])).unwrap();
+        let ok = cache.get_or_decode(3, false, || Ok(vec![1u8; 16])).unwrap();
         assert_eq!(ok.len(), 16);
     }
 
@@ -321,7 +343,9 @@ mod tests {
         let cache = Arc::new(BlockCache::new(1 << 20));
         let c = Arc::clone(&cache);
         let panicked = std::thread::spawn(move || {
-            c.get_or_decode(4, || -> Result<Vec<u8>> { panic!("decoder exploded") })
+            c.get_or_decode(4, false, || -> Result<Vec<u8>> {
+                panic!("decoder exploded")
+            })
         })
         .join();
         assert!(panicked.is_err(), "the decode was expected to panic");
@@ -329,7 +353,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let c = Arc::clone(&cache);
         std::thread::spawn(move || {
-            let r = c.get_or_decode(4, || Ok(vec![2u8; 8]));
+            let r = c.get_or_decode(4, false, || Ok(vec![2u8; 8]));
             tx.send(r.map(|b| b.len())).unwrap();
         });
         let got = rx
@@ -342,7 +366,9 @@ mod tests {
     fn memory_stays_within_the_budget() {
         let cache = BlockCache::new(4096);
         for i in 0..64u32 {
-            cache.get_or_decode(i, || Ok(vec![0u8; 1024])).unwrap();
+            cache
+                .get_or_decode(i, false, || Ok(vec![0u8; 1024]))
+                .unwrap();
             assert!(
                 cache.used() <= cache.budget(),
                 "used {} exceeds budget {}",
@@ -362,7 +388,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for i in 0..32u32 {
                     cache
-                        .get_or_decode(t * 32 + i, || Ok(vec![0u8; 1024]))
+                        .get_or_decode(t * 32 + i, false, || Ok(vec![0u8; 1024]))
                         .unwrap();
                     assert!(cache.used() <= cache.budget());
                 }
@@ -377,7 +403,9 @@ mod tests {
     #[test]
     fn a_block_larger_than_the_budget_is_served_but_not_retained() {
         let cache = BlockCache::new(1024);
-        let b = cache.get_or_decode(0, || Ok(vec![5u8; 4096])).unwrap();
+        let b = cache
+            .get_or_decode(0, false, || Ok(vec![5u8; 4096]))
+            .unwrap();
         assert_eq!(b.len(), 4096);
         assert_eq!(cache.used(), 0);
     }
@@ -388,13 +416,17 @@ mod tests {
         const BLOCK: usize = 4096;
         let cache = BlockCache::new(blocks_held * BLOCK);
         for i in 0..blocks_held as u32 {
-            cache.get_or_decode(i, || Ok(vec![0u8; BLOCK])).unwrap();
+            cache
+                .get_or_decode(i, false, || Ok(vec![0u8; BLOCK]))
+                .unwrap();
         }
         let before = cache.examined();
         const EVICTIONS: u32 = 64;
         for i in 0..EVICTIONS {
             let index = blocks_held as u32 + i;
-            cache.get_or_decode(index, || Ok(vec![0u8; BLOCK])).unwrap();
+            cache
+                .get_or_decode(index, false, || Ok(vec![0u8; BLOCK]))
+                .unwrap();
         }
         (cache.examined() - before) as f64 / EVICTIONS as f64
     }

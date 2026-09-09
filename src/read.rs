@@ -412,6 +412,26 @@ impl std::ops::Deref for Block<'_> {
     }
 }
 
+/// How far a file's reads have advanced contiguously.
+#[derive(Clone, Copy, Default)]
+struct Run {
+    ino: u32,
+    /// Offset a read would have to start at to continue the run.
+    next: u64,
+    /// Contiguous reads seen so far.
+    length: u32,
+}
+
+/// Files tracked for sequential access at once.
+///
+/// A fixed table keyed by inode, so the state cannot grow with the tree. A
+/// collision loses one file's history, which costs a missed recognition and
+/// nothing else.
+const RUN_SLOTS: usize = 64;
+
+/// Contiguous reads before a run counts as sequential.
+const RUN_THRESHOLD: u32 = 4;
+
 /// A borrowing view over an image's metadata, built once and reused.
 ///
 /// Every section is verified when the reader is created, so later reads do
@@ -428,6 +448,7 @@ pub struct Reader<'i> {
     widths: InodeWidths,
     blocks: BlockIndex<'i>,
     cache: crate::cache::BlockCache,
+    runs: std::sync::Mutex<[Run; RUN_SLOTS]>,
     metrics: crate::metrics::Metrics,
     #[cfg(feature = "zstd")]
     dictionary: Option<zstd::dict::DecoderDictionary<'static>>,
@@ -833,8 +854,44 @@ impl<'i> Reader<'i> {
     }
 
     /// The decoded bytes of one block.
-    fn block(&self, index: u32) -> Result<Block<'_>> {
+    /// Record where this read leaves the file, and say whether the file is
+    /// being streamed rather than read at scattered offsets.
+    ///
+    /// Recognition only decides whether a decoded block is worth keeping. It
+    /// never changes which bytes a read returns.
+    fn note_access(&self, ino: u32, offset: u64, len: u64) -> bool {
+        let slot = ino as usize % RUN_SLOTS;
+        let Ok(mut runs) = self.runs.lock() else {
+            return false;
+        };
+        let run = &mut runs[slot];
+        if run.ino == ino && run.next == offset {
+            run.length = run.length.saturating_add(1);
+            run.next = offset + len;
+            if run.length == RUN_THRESHOLD {
+                self.note(|m| &m.sequential_runs);
+            }
+            if run.length > RUN_THRESHOLD {
+                self.note(|m| &m.sequential_continued);
+            }
+            return run.length >= RUN_THRESHOLD;
+        }
+        if run.ino == ino && run.length >= RUN_THRESHOLD {
+            self.note(|m| &m.sequential_broken);
+        }
+        *run = Run {
+            ino,
+            next: offset + len,
+            length: 1,
+        };
+        false
+    }
+
+    fn block(&self, index: u32, streaming: bool) -> Result<Block<'_>> {
         self.note(|m| &m.block_fetches);
+        if streaming {
+            self.note(|m| &m.streamed_blocks);
+        }
         let e = self.blocks.get(index).ok_or(Error::Malformed {
             detail: "a stream offset falls outside the block index",
         })?;
@@ -863,7 +920,7 @@ impl<'i> Reader<'i> {
         let bytes = self.phase(
             |m| &m.fetch_ns,
             || {
-                self.cache.get_or_decode(index, move || {
+                self.cache.get_or_decode(index, streaming, move || {
                     // The digest sits immediately after the block, so one call fetches
                     // both. Reading it separately doubled the calls into the source.
                     let mut raw = vec![0u8; e.stored_length as usize + 8];
@@ -957,6 +1014,7 @@ impl<'i> Reader<'i> {
         let block_size = self.superblock.block_size as u64;
 
         self.note(|m| &m.reads);
+        let streaming = self.note_access(ino, offset, want as u64);
         let mut done = 0usize;
         while done < want {
             let at = offset + done as u64;
@@ -972,7 +1030,7 @@ impl<'i> Reader<'i> {
                     detail: "a stream offset falls outside the block index",
                 })?;
             let within = (stream_offset % block_size) as usize;
-            let bytes = self.block(block_index)?;
+            let bytes = self.block(block_index, streaming)?;
             let available = bytes.len().checked_sub(within).ok_or(Error::Malformed {
                 detail: "an extent points past the end of its block",
             })?;
@@ -1029,6 +1087,7 @@ impl<'a> Image<'a> {
             names: self.section_data(SectionKind::Names)?,
             blocks: self.block_index()?,
             cache: crate::cache::BlockCache::new(budget),
+            runs: std::sync::Mutex::new([Run::default(); RUN_SLOTS]),
             metrics: crate::metrics::Metrics::default(),
             #[cfg(feature = "zstd")]
             dictionary: {

@@ -18,6 +18,15 @@ use crate::format::{
 
 use std::collections::{BTreeMap, HashMap};
 
+/// Lowest compression level a caller may ask for.
+pub const MIN_LEVEL: i32 = 1;
+
+/// Highest compression level a caller may ask for.
+///
+/// The compressor clamps anything above this without saying so, which would
+/// turn a higher number into this one rather than doing what was asked.
+pub const MAX_LEVEL: i32 = 22;
+
 /// How an image is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
@@ -245,6 +254,11 @@ impl Builder {
         if options.codecs & Codec::Stored.bit() == 0 {
             return Err(Error::Malformed {
                 detail: "the stored codec cannot be excluded",
+            });
+        }
+        if !(MIN_LEVEL..=MAX_LEVEL).contains(&options.level) {
+            return Err(Error::Malformed {
+                detail: "compression level is outside the range one to twenty two",
             });
         }
         Ok(Builder {

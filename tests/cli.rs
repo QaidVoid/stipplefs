@@ -508,3 +508,55 @@ fn the_build_help_names_the_defaults_and_what_reproducibility_costs() {
         "the help does not say what the memory limit cannot do:\n{help}"
     );
 }
+
+#[test]
+fn the_highest_level_does_more_than_the_ordinary_one() {
+    let s = Scratch::new("levels");
+    let src = s.path("src");
+    make_tree(&src);
+    let mut images = Vec::new();
+    for level in ["19", "22"] {
+        let out = s.path(&format!("l{level}.stipple"));
+        let built = Command::new(MK)
+            .arg(&src)
+            .arg(&out)
+            .args(["--block-size", "4096", "--level", level, "--mtime", "zero"])
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "building at level {level} failed");
+        images.push(std::fs::read(&out).unwrap());
+    }
+    assert!(
+        images[0] != images[1],
+        "level 22 produced the same image as level 19, so the level is ignored"
+    );
+}
+
+#[test]
+fn a_level_outside_the_range_is_refused_by_name() {
+    let s = Scratch::new("badlevel");
+    let src = s.path("src");
+    make_tree(&src);
+    for level in ["0", "23", "100"] {
+        let out = s.path(&format!("bad{level}.stipple"));
+        let built = Command::new(MK)
+            .arg(&src)
+            .arg(&out)
+            .args(["--block-size", "4096", "--level", level, "--mtime", "zero"])
+            .output()
+            .unwrap();
+        assert!(
+            !built.status.success(),
+            "level {level} was accepted rather than refused"
+        );
+        let message = String::from_utf8_lossy(&built.stderr);
+        assert!(
+            message.contains("one to twenty two"),
+            "the refusal did not name the accepted range: {message}"
+        );
+        assert!(
+            !out.exists(),
+            "a refused build left an image behind for level {level}"
+        );
+    }
+}

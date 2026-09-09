@@ -169,6 +169,16 @@ enum Tree {
     },
 }
 
+/// A file whose content has not been placed into the stream yet.
+///
+/// Structure is decided in one pass and content in another, so that the order
+/// content is placed in can differ from the order the tree is walked in.
+enum Pending<'a> {
+    Bytes(&'a [u8]),
+    #[cfg(feature = "fs")]
+    Path(&'a std::path::Path),
+}
+
 /// How many entries of each kind a builder holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counts {
@@ -466,7 +476,9 @@ impl Builder {
         let cfg = ChunkerConfig::new(self.options.chunk_average);
         let mut plan = Plan::new(Spill::create()?);
         let root = plan.alloc();
-        self.visit(&self.root, root, &mut plan, &cfg, &[])?;
+        let mut placements = Vec::new();
+        self.visit(&self.root, root, &mut plan, &[], &mut placements)?;
+        self.place_all(&placements, &mut plan, &cfg)?;
 
         let mut counts = vec![0u32; plan.inodes.len()];
         for d in &plan.dirents {
@@ -479,13 +491,13 @@ impl Builder {
         self.emit(plan, out)
     }
 
-    fn visit(
-        &self,
-        dir: &Dir,
+    fn visit<'a>(
+        &'a self,
+        dir: &'a Dir,
         ino: u32,
         plan: &mut Plan,
-        cfg: &ChunkerConfig,
         prefix: &[u8],
+        placements: &mut Vec<(u32, Pending<'a>)>,
     ) -> Result<()> {
         let start = plan.dirents.len();
         plan.dirents
@@ -533,9 +545,9 @@ impl Builder {
                         nested.push(b'/');
                     }
                     nested.extend_from_slice(name);
-                    self.visit(d, child, plan, cfg, &nested)?
+                    self.visit(d, child, plan, &nested, placements)?
                 }
-                Tree::Node(node) => self.emit_node(child, node, plan, cfg)?,
+                Tree::Node(node) => self.record_node(child, node, plan, placements)?,
                 #[cfg(feature = "fs")]
                 Tree::FileAt {
                     path,
@@ -544,14 +556,18 @@ impl Builder {
                     gid,
                     link_group,
                 } => {
-                    let node = Node::File {
-                        content: std::fs::read(path)?,
-                        mode: *mode,
-                        uid: *uid,
-                        gid: *gid,
-                        link_group: *link_group,
-                    };
-                    self.emit_node(child, &node, plan, cfg)?
+                    if plan.inodes[child as usize].mode == 0 {
+                        if let Some(group) = link_group {
+                            plan.links.insert(*group, child);
+                        }
+                        plan.inodes[child as usize] = InodeRec {
+                            mode: S_IFREG | (mode & 0o7777),
+                            uid: *uid,
+                            gid: *gid,
+                            ..InodeRec::default()
+                        };
+                        placements.push((child, Pending::Path(path)));
+                    }
                 }
             }
 
@@ -581,7 +597,13 @@ impl Builder {
         Ok(())
     }
 
-    fn emit_node(&self, ino: u32, node: &Node, plan: &mut Plan, cfg: &ChunkerConfig) -> Result<()> {
+    fn record_node<'a>(
+        &self,
+        ino: u32,
+        node: &'a Node,
+        plan: &mut Plan,
+        placements: &mut Vec<(u32, Pending<'a>)>,
+    ) -> Result<()> {
         match node {
             Node::Directory { .. } => unreachable!("directories are visited, not emitted"),
             Node::Special {
@@ -656,11 +678,10 @@ impl Builder {
                 if let Some(g) = link_group {
                     plan.links.insert(*g, ino);
                 }
-                let (payload, extent_count) = self.place(content, plan, cfg)?;
                 plan.inodes[ino as usize] = InodeRec {
-                    size: content.len() as u64,
-                    payload,
-                    extent_count,
+                    size: 0,
+                    payload: 0,
+                    extent_count: 0,
                     mode: S_IFREG | (mode & 0o7777),
                     uid: *uid,
                     gid: *gid,
@@ -668,7 +689,30 @@ impl Builder {
                     mtime: 0,
                     xattr: None,
                 };
+                placements.push((ino, Pending::Bytes(content)));
             }
+        }
+        Ok(())
+    }
+
+    /// Place every file's content into the stream, in the order given.
+    fn place_all(
+        &self,
+        placements: &[(u32, Pending<'_>)],
+        plan: &mut Plan,
+        cfg: &ChunkerConfig,
+    ) -> Result<()> {
+        for (ino, pending) in placements {
+            let content: std::borrow::Cow<'_, [u8]> = match pending {
+                Pending::Bytes(bytes) => std::borrow::Cow::Borrowed(bytes),
+                #[cfg(feature = "fs")]
+                Pending::Path(path) => std::borrow::Cow::Owned(std::fs::read(path)?),
+            };
+            let (payload, extent_count) = self.place(&content, plan, cfg)?;
+            let rec = &mut plan.inodes[*ino as usize];
+            rec.size = content.len() as u64;
+            rec.payload = payload;
+            rec.extent_count = extent_count;
         }
         Ok(())
     }

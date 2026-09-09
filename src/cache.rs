@@ -23,6 +23,8 @@ struct Inner {
     /// Cached blocks keyed by class and then by the tick they were last
     /// wanted at, so the first entry is the best one to drop.
     order: BTreeMap<(u8, u64), u32>,
+    /// Bytes held for sequential runs, capped separately from the budget.
+    streamed: usize,
     decoding: Vec<u32>,
     used: usize,
     clock: u64,
@@ -132,6 +134,13 @@ impl BlockCache {
             {
                 let now = inner.tick();
                 let class = class_of(streaming);
+                if was.0 != class {
+                    if class == STREAMED {
+                        inner.streamed += bytes.len();
+                    } else {
+                        inner.streamed -= bytes.len();
+                    }
+                }
                 if let Some(slot) = inner.ready.get_mut(&index) {
                     slot.used_at = now;
                     slot.class = class;
@@ -168,6 +177,13 @@ impl BlockCache {
         inner.decoding.retain(|&i| i != index);
         flight.done = true;
         if bytes.len() <= self.budget {
+            if streaming {
+                // A run keeps only enough to serve the reads landing inside
+                // the block it is passing through. Letting it fill a large
+                // budget costs memory it will never read again.
+                let cap = (self.budget / 8).max(2 * bytes.len());
+                drop_streamed_over(&mut inner, cap.saturating_sub(bytes.len()));
+            }
             self.examined.fetch_add(
                 evict_for(&mut inner, bytes.len(), self.budget),
                 Ordering::Relaxed,
@@ -182,8 +198,14 @@ impl BlockCache {
             if let Some(previous) = inner.ready.insert(index, slot) {
                 inner.order.remove(&(previous.class, previous.used_at));
                 inner.used -= previous.bytes.len();
+                if previous.class == STREAMED {
+                    inner.streamed -= previous.bytes.len();
+                }
             }
             inner.used += bytes.len();
+            if class == STREAMED {
+                inner.streamed += bytes.len();
+            }
             inner.order.insert((class, now), index);
         }
         drop(inner);
@@ -202,6 +224,20 @@ fn class_of(streaming: bool) -> u8 {
     if streaming { STREAMED } else { RETAINED }
 }
 
+/// Drop the oldest streamed blocks until they hold no more than `cap` bytes.
+fn drop_streamed_over(inner: &mut Inner, cap: usize) {
+    while inner.streamed > cap {
+        let Some((&key, &index)) = inner.order.range((STREAMED, 0)..(RETAINED, 0)).next() else {
+            return;
+        };
+        inner.order.remove(&key);
+        if let Some(slot) = inner.ready.remove(&index) {
+            inner.used -= slot.bytes.len();
+            inner.streamed -= slot.bytes.len();
+        }
+    }
+}
+
 /// Drop least recently wanted blocks until `incoming` more bytes fit.
 ///
 /// The oldest entry is the front of the ordered index, so the cost of choosing
@@ -216,6 +252,9 @@ fn evict_for(inner: &mut Inner, incoming: usize, budget: usize) -> u64 {
         examined += 1;
         if let Some(slot) = inner.ready.remove(&index) {
             inner.used -= slot.bytes.len();
+            if slot.class == STREAMED {
+                inner.streamed -= slot.bytes.len();
+            }
         }
     }
     examined

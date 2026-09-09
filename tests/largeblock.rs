@@ -345,3 +345,24 @@ fn streaming_decodes_each_block_once() {
         "streaming a file spanning {spans} blocks decoded {misses} times"
     );
 }
+
+#[test]
+fn a_sequential_pass_does_not_fill_a_large_cache() {
+    // A budget nothing can exhaust still must not end up holding every block a
+    // one-pass read went through, because none of them will be read again.
+    let block = 1 << 16;
+    let image = image_with_blocks(block, 200, 200 * 1024);
+    let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+    let blocks = img.block_index().unwrap().count() as usize;
+    let r = img
+        .reader_with_budget((blocks + 8) * block as usize)
+        .unwrap();
+    for ino in 1..=200u32 {
+        stream_file(&r, ino, 4096);
+    }
+    let held = r.cache_used() / block as usize;
+    assert!(
+        held * 2 < blocks,
+        "after streaming {blocks} blocks the cache still holds {held} of them"
+    );
+}

@@ -4,7 +4,7 @@
 //! than each performing their own, and different blocks decode in parallel.
 
 use crate::error::{Error, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -17,6 +17,9 @@ struct Slot {
 #[derive(Default)]
 struct Inner {
     ready: HashMap<u32, Slot>,
+    /// Cached blocks keyed by the tick they were last wanted at, so that the
+    /// least recently wanted one is the first entry rather than a search.
+    order: BTreeMap<u64, u32>,
     decoding: Vec<u32>,
     used: usize,
     clock: u64,
@@ -35,6 +38,7 @@ pub struct BlockCache {
     changed: Condvar,
     budget: usize,
     decodes: AtomicU64,
+    examined: AtomicU64,
 }
 
 /// Clears the in-flight marker even if the decoder panics or returns early.
@@ -66,6 +70,7 @@ impl BlockCache {
             changed: Condvar::new(),
             budget,
             decodes: AtomicU64::new(0),
+            examined: AtomicU64::new(0),
         }
     }
 
@@ -78,6 +83,14 @@ impl BlockCache {
     /// from a miss without the cache knowing what a metric is.
     pub fn decodes(&self) -> u64 {
         self.decodes.load(Ordering::Relaxed)
+    }
+
+    /// How many cached blocks eviction has inspected to decide what to drop.
+    ///
+    /// Divided by the number of evictions, this says whether the cost of
+    /// choosing a block grows with how many are held.
+    pub fn examined(&self) -> u64 {
+        self.examined.load(Ordering::Relaxed)
     }
 
     /// Bytes currently held.
@@ -104,11 +117,18 @@ impl BlockCache {
     {
         let mut inner = self.lock();
         loop {
-            if inner.ready.contains_key(&index) {
+            if let Some((was, bytes)) = inner
+                .ready
+                .get(&index)
+                .map(|slot| (slot.used_at, Arc::clone(&slot.bytes)))
+            {
                 let now = inner.tick();
-                let slot = inner.ready.get_mut(&index).expect("just checked");
-                slot.used_at = now;
-                return Ok(Arc::clone(&slot.bytes));
+                if let Some(slot) = inner.ready.get_mut(&index) {
+                    slot.used_at = now;
+                }
+                inner.order.remove(&was);
+                inner.order.insert(now, index);
+                return Ok(bytes);
             }
             if inner.decoding.contains(&index) {
                 inner = match self.changed.wait(inner) {
@@ -138,15 +158,21 @@ impl BlockCache {
         inner.decoding.retain(|&i| i != index);
         flight.done = true;
         if bytes.len() <= self.budget {
-            evict_for(&mut inner, bytes.len(), self.budget);
+            self.examined.fetch_add(
+                evict_for(&mut inner, bytes.len(), self.budget),
+                Ordering::Relaxed,
+            );
             let now = inner.tick();
             let slot = Slot {
                 bytes: Arc::clone(&bytes),
                 used_at: now,
             };
-            if inner.ready.insert(index, slot).is_none() {
-                inner.used += bytes.len();
+            if let Some(previous) = inner.ready.insert(index, slot) {
+                inner.order.remove(&previous.used_at);
+                inner.used -= previous.bytes.len();
             }
+            inner.used += bytes.len();
+            inner.order.insert(now, index);
         }
         drop(inner);
         self.changed.notify_all();
@@ -156,24 +182,21 @@ impl BlockCache {
 
 /// Drop least recently wanted blocks until `incoming` more bytes fit.
 ///
-/// Finding the oldest entry is linear in the number of cached blocks, but it
-/// only runs when an insert would exceed the budget, and every such insert has
-/// just paid for a decode. Promotion on a hit, which is the hot path, is
-/// constant time.
-fn evict_for(inner: &mut Inner, incoming: usize, budget: usize) {
+/// The oldest entry is the front of the ordered index, so the cost of choosing
+/// does not grow with how many blocks are held. Returns how many were
+/// inspected to decide.
+fn evict_for(inner: &mut Inner, incoming: usize, budget: usize) -> u64 {
+    let mut examined = 0;
     while inner.used + incoming > budget {
-        let Some(oldest) = inner
-            .ready
-            .iter()
-            .min_by_key(|(_, slot)| slot.used_at)
-            .map(|(index, _)| *index)
-        else {
-            return;
+        let Some((_, index)) = inner.order.pop_first() else {
+            return examined;
         };
-        if let Some(slot) = inner.ready.remove(&oldest) {
+        examined += 1;
+        if let Some(slot) = inner.ready.remove(&index) {
             inner.used -= slot.bytes.len();
         }
     }
+    examined
 }
 
 /// Raised when a caller asks for a budget that cannot hold a single block.
@@ -357,5 +380,33 @@ mod tests {
         let b = cache.get_or_decode(0, || Ok(vec![5u8; 4096])).unwrap();
         assert_eq!(b.len(), 4096);
         assert_eq!(cache.used(), 0);
+    }
+
+    /// Force a fixed number of evictions against caches of very different
+    /// sizes, and compare how much each had to inspect to choose.
+    fn examined_per_eviction(blocks_held: usize) -> f64 {
+        const BLOCK: usize = 4096;
+        let cache = BlockCache::new(blocks_held * BLOCK);
+        for i in 0..blocks_held as u32 {
+            cache.get_or_decode(i, || Ok(vec![0u8; BLOCK])).unwrap();
+        }
+        let before = cache.examined();
+        const EVICTIONS: u32 = 64;
+        for i in 0..EVICTIONS {
+            let index = blocks_held as u32 + i;
+            cache.get_or_decode(index, || Ok(vec![0u8; BLOCK])).unwrap();
+        }
+        (cache.examined() - before) as f64 / EVICTIONS as f64
+    }
+
+    #[test]
+    fn choosing_what_to_evict_does_not_scan_the_cache() {
+        let small = examined_per_eviction(64);
+        let large = examined_per_eviction(4096);
+        assert!(
+            large < small * 4.0,
+            "eviction inspected {large:.1} blocks per eviction with 4096 held \
+             against {small:.1} with 64, so the cost grows with the cache"
+        );
     }
 }

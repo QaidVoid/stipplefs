@@ -62,7 +62,7 @@ fn run(args: Args) -> Result<(), String> {
     let codecs = if args.no_compress {
         Codec::Stored.bit()
     } else {
-        Codec::Stored.bit() | Codec::Zstd.bit() | Codec::ZstdDict.bit()
+        Codec::Stored.bit() | Codec::Zstd.bit() | Codec::ZstdDict.bit() | Codec::ZstdSpan.bit()
     };
     let options = Options {
         block_size: args.block_size,

@@ -67,7 +67,10 @@ impl Default for Options {
         Options {
             block_size: 65536,
             chunk_average: 65536,
-            codecs: Codec::Stored.bit() | Codec::Zstd.bit() | Codec::ZstdDict.bit(),
+            codecs: Codec::Stored.bit()
+                | Codec::Zstd.bit()
+                | Codec::ZstdDict.bit()
+                | Codec::ZstdSpan.bit(),
             level: 19,
             dictionary_size: 112 * 1024,
             threads: 1,
@@ -844,6 +847,13 @@ fn digest(bytes: &[u8]) -> u64 {
     twox_hash::XxHash3_64::oneshot(bytes)
 }
 
+/// The two ways a block can be stored: on its own, or against the one before
+/// it. Both are prepared so the choice can be made in one pass afterwards.
+struct Candidate {
+    alone: (Codec, Vec<u8>),
+    against_previous: Option<Vec<u8>>,
+}
+
 /// Where one compressed block ended up in the scratch file, and what the
 /// block index has to say about it.
 struct EncodedBlock {
@@ -899,33 +909,90 @@ impl Builder {
     /// Each worker takes a contiguous run and results are reassembled in index
     /// order, so the output does not depend on the thread count or on which
     /// worker finishes first.
-    fn encode_blocks(&self, blocks: &[&[u8]], dict: Option<&[u8]>) -> Vec<(Codec, Vec<u8>)> {
+    /// Compress every block, optionally across several threads.
+    ///
+    /// Each block is compressed on its own and again against the block before
+    /// it. A left to right pass then takes the smaller, except that a block
+    /// following one that already refers backwards must stand alone, which
+    /// keeps every reference exactly one deep.
+    ///
+    /// `prior` is the block before this run and `prior_refers` says whether it
+    /// refers backwards, so the pass gives the same answer wherever the runs
+    /// are cut.
+    fn encode_blocks(
+        &self,
+        blocks: &[&[u8]],
+        dict: Option<&[u8]>,
+        prior: Option<&[u8]>,
+        prior_refers: bool,
+    ) -> (Vec<(Codec, Vec<u8>)>, bool) {
+        let base_for =
+            |j: usize| -> Option<&[u8]> { if j > 0 { Some(blocks[j - 1]) } else { prior } };
+        let one = |j: usize| -> Candidate {
+            Candidate {
+                alone: self.encode_block(blocks[j], dict),
+                against_previous: base_for(j).and_then(|b| self.encode_span(blocks[j], b)),
+            }
+        };
+
         let threads = self.options.threads.clamp(1, blocks.len().max(1));
-        if threads == 1 {
-            return blocks.iter().map(|b| self.encode_block(b, dict)).collect();
-        }
-        let per = blocks.len().div_ceil(threads);
-        let parts: Vec<&[&[u8]]> = blocks.chunks(per).collect();
-        let mut collected: Vec<Vec<(Codec, Vec<u8>)>> = Vec::with_capacity(parts.len());
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = parts
-                .iter()
-                .map(|part| {
-                    scope.spawn(move || {
-                        part.iter()
-                            .map(|b| self.encode_block(b, dict))
-                            .collect::<Vec<_>>()
-                    })
-                })
+        let candidates: Vec<Candidate> = if threads == 1 {
+            (0..blocks.len()).map(one).collect()
+        } else {
+            let per = blocks.len().div_ceil(threads);
+            let ranges: Vec<(usize, usize)> = (0..blocks.len())
+                .step_by(per)
+                .map(|start| (start, (start + per).min(blocks.len())))
                 .collect();
-            for h in handles {
-                match h.join() {
-                    Ok(v) => collected.push(v),
-                    Err(panic) => std::panic::resume_unwind(panic),
+            let mut collected = Vec::with_capacity(ranges.len());
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = ranges
+                    .iter()
+                    .map(|&(start, end)| {
+                        scope.spawn(move || (start..end).map(&one).collect::<Vec<_>>())
+                    })
+                    .collect();
+                for h in handles {
+                    match h.join() {
+                        Ok(v) => collected.push(v),
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    }
+                }
+            });
+            collected.into_iter().flatten().collect()
+        };
+
+        let mut refers = prior_refers;
+        let mut out = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            match candidate.against_previous {
+                Some(z) if !refers && z.len() < candidate.alone.1.len() => {
+                    refers = true;
+                    out.push((Codec::ZstdSpan, z));
+                }
+                _ => {
+                    refers = false;
+                    out.push(candidate.alone);
                 }
             }
-        });
-        collected.into_iter().flatten().collect()
+        }
+        (out, refers)
+    }
+
+    /// Compress `raw` against the preceding block's bytes, if that codec is
+    /// permitted and the compressor accepts them.
+    #[allow(unused_variables)]
+    fn encode_span(&self, raw: &[u8], base: &[u8]) -> Option<Vec<u8>> {
+        #[cfg(feature = "zstd")]
+        {
+            if self.options.codecs & Codec::ZstdSpan.bit() == 0 {
+                return None;
+            }
+            let mut c = zstd::bulk::Compressor::with_dictionary(self.options.level, base).ok()?;
+            c.compress(raw).ok()
+        }
+        #[cfg(not(feature = "zstd"))]
+        None
     }
 
     /// Train a dictionary from evenly spaced blocks.
@@ -1123,6 +1190,8 @@ impl Builder {
         let stream_len = stream.len;
         let batch = self.batch_size(block_size);
         let mut blocks = Vec::with_capacity(block_count);
+        let mut prior: Option<Vec<u8>> = None;
+        let mut prior_refers = false;
         let mut index = 0;
         while index < block_count {
             let n = batch.min(block_count - index);
@@ -1135,7 +1204,10 @@ impl Builder {
                 raw.push(b);
             }
             let refs: Vec<&[u8]> = raw.iter().map(|b| b.as_slice()).collect();
-            let encoded = self.encode_blocks(&refs, dict);
+            let (encoded, last_refers) =
+                self.encode_blocks(&refs, dict, prior.as_deref(), prior_refers);
+            prior_refers = last_refers;
+            prior = raw.last().cloned();
             for ((codec, enc), decoded) in encoded.iter().zip(&raw) {
                 blocks.push(EncodedBlock {
                     codec: *codec,
@@ -1157,10 +1229,13 @@ impl Builder {
     /// unit compression works on.
     fn batch_size(&self, block_size: usize) -> usize {
         let threads = self.options.threads.max(1);
-        match self.options.memory_limit {
+        let want = match self.options.memory_limit {
             None => threads,
             Some(limit) => (limit / block_size.max(1) / 2).clamp(1, threads),
-        }
+        };
+        // Batches start on even blocks, so an even size keeps every span
+        // block's base in the same batch as the block itself.
+        want.next_multiple_of(2)
     }
 }
 

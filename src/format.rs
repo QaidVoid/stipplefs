@@ -65,6 +65,12 @@ pub enum Codec {
     Zstd,
     /// Zstandard frame using the image's dictionary.
     ZstdDict,
+    /// Zstandard frame using the preceding block's decoded bytes as its
+    /// dictionary.
+    ///
+    /// Blocks pair up, so the block a span block refers to is always a plain
+    /// one. Serving a span block costs one extra decode and never a chain.
+    ZstdSpan,
 }
 
 impl Codec {
@@ -74,6 +80,7 @@ impl Codec {
             0 => Some(Codec::Stored),
             1 => Some(Codec::Zstd),
             2 => Some(Codec::ZstdDict),
+            3 => Some(Codec::ZstdSpan),
             _ => None,
         }
     }
@@ -84,6 +91,7 @@ impl Codec {
             Codec::Stored => 0,
             Codec::Zstd => 1,
             Codec::ZstdDict => 2,
+            Codec::ZstdSpan => 3,
         }
     }
 
@@ -104,6 +112,7 @@ pub const fn supported_codecs() -> u16 {
     {
         mask |= Codec::Zstd.bit();
         mask |= Codec::ZstdDict.bit();
+        mask |= Codec::ZstdSpan.bit();
     }
     mask
 }

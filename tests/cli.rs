@@ -513,7 +513,14 @@ fn the_build_help_names_the_defaults_and_what_reproducibility_costs() {
 fn the_highest_level_does_more_than_the_ordinary_one() {
     let s = Scratch::new("levels");
     let src = s.path("src");
-    make_tree(&src);
+    std::fs::create_dir_all(&src).unwrap();
+    // Enough varied content for the level to have something to work on. A
+    // handful of tiny files compress identically at either level, which says
+    // nothing about whether the level was honoured.
+    for i in 0..40u32 {
+        let unit = format!("module {i}: a fairly ordinary line of source text. ");
+        std::fs::write(src.join(format!("f{i:03}.txt")), unit.repeat(900)).unwrap();
+    }
     let mut images = Vec::new();
     for level in ["19", "22"] {
         let out = s.path(&format!("l{level}.stipple"));

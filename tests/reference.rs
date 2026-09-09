@@ -141,6 +141,14 @@ impl Reference {
                 let mut d = zstd::bulk::Decompressor::with_dictionary(dict).unwrap();
                 d.decompress(raw, decoded_length).expect("zstd-dict block")
             }
+            3 => {
+                // A span block is decoded against the block before it, which
+                // the format guarantees is not itself a span block.
+                assert!(index > 0, "block 0 cannot be a span block");
+                let base = self.decode_block(index - 1);
+                let mut d = zstd::bulk::Decompressor::with_dictionary(&base).unwrap();
+                d.decompress(raw, decoded_length).expect("zstd-span block")
+            }
             other => panic!("unknown codec {other}"),
         };
         assert_eq!(

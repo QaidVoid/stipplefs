@@ -134,7 +134,7 @@ pub(crate) fn parse_superblock(
     if missing != 0 {
         return Err(Error::UnsupportedCodec { missing });
     }
-    if codec_mask & !((1 << (Codec::ZstdDict.id() + 1)) - 1) != 0 {
+    if codec_mask & !((1 << (Codec::ZstdSpan.id() + 1)) - 1) != 0 {
         return Err(Error::Malformed {
             detail: "codec_mask names a codec the format does not define",
         });
@@ -915,6 +915,31 @@ impl<'i> Reader<'i> {
             }
         }
 
+        // A span block is decoded against the one before it, which is fetched
+        // first so that no cache lookup happens inside a decode. Its base is
+        // never itself a span block, so this recurses exactly once. Without a
+        // decompressor the image is refused at open, so there is nothing to
+        // fetch.
+        #[cfg(feature = "zstd")]
+        let base = if e.codec == Codec::ZstdSpan {
+            let previous = index.checked_sub(1).ok_or(Error::Malformed {
+                detail: "the first block cannot refer to a preceding one",
+            })?;
+            let entry = self.blocks.get(previous).ok_or(Error::Malformed {
+                detail: "a span block refers outside the block index",
+            })?;
+            if entry.codec == Codec::ZstdSpan {
+                return Err(Error::Malformed {
+                    detail: "a span block refers to another span block",
+                });
+            }
+            Some(self.block(previous, streaming)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "zstd")]
+        let base = base.as_deref();
+
         let region = self.region;
         let before = self.cache.decodes();
         let bytes = self.phase(
@@ -971,6 +996,26 @@ impl<'i> Reader<'i> {
                         }
                         #[cfg(not(feature = "zstd"))]
                         Codec::ZstdDict => {
+                            return Err(Error::UnsupportedCodec {
+                                missing: e.codec.bit(),
+                            });
+                        }
+                        #[cfg(feature = "zstd")]
+                        Codec::ZstdSpan => {
+                            let previous = base.ok_or(Error::Malformed {
+                                detail: "a span block has no preceding block to decode against",
+                            })?;
+                            let mut d = self.phase(
+                                |m| &m.dctx_ns,
+                                || zstd::bulk::Decompressor::with_dictionary(previous),
+                            )?;
+                            self.phase(
+                                |m| &m.decode_ns,
+                                || d.decompress(&raw, e.decoded_length as usize),
+                            )?
+                        }
+                        #[cfg(not(feature = "zstd"))]
+                        Codec::ZstdSpan => {
                             return Err(Error::UnsupportedCodec {
                                 missing: e.codec.bit(),
                             });

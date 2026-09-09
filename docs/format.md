@@ -97,6 +97,7 @@ affected read.
 | 0 | `0x0001` | `stored` | block bytes are the decoded bytes |
 | 1 | `0x0002` | `zstd` | Zstandard frame, no dictionary |
 | 2 | `0x0004` | `zstd-dict` | Zstandard frame using the image's dictionary |
+| 3 | `0x0008` | `zstd-span` | Zstandard frame using the preceding block's decoded bytes |
 
 `codec_mask` SHALL have exactly the bits of the codecs actually used. A reader
 that does not implement `zstd` may still open an image whose `codec_mask` is
@@ -126,6 +127,13 @@ A reader SHALL reject the image unless, for every block: the stored bytes lie
 within `[4096, image_length)`; `decoded_length` is at most `block_size`; and
 `codec`'s bit is set in `codec_mask`. When decoding produces a length other
 than `decoded_length`, the read SHALL fail and return nothing to the caller.
+
+A block whose codec is `zstd-span` is decoded with the decoded bytes of block
+`i - 1` as its dictionary. Block 0 SHALL NOT use `zstd-span`, and the block a
+`zstd-span` block refers to SHALL NOT itself use `zstd-span`. A reader SHALL
+reject an image violating either. Those two rules together bound the work of
+serving a block at two decodes and make a reference cycle unrepresentable, so a
+reader never needs to track how deep it has followed one.
 
 Each block's stored bytes are followed by an 8-byte `xxh3-64` digest of those
 stored bytes. `stored_length` excludes the digest.
@@ -282,6 +290,12 @@ dictionaries section.
 One dictionary per image is deliberate. Blocks are compressed independently and
 seeded from the same dictionary, which is what lets a small block reach a ratio
 close to a much larger one without enlarging the decode unit.
+
+`zstd-span` serves the same end by a different route: rather than one
+dictionary shared by every block, a block borrows the block before it. That
+costs nothing resident, since the preceding block is already what a sequential
+reader has just decoded, and at most one extra decode for a reader arriving
+cold.
 
 ## Integrity
 

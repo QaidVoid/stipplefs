@@ -110,13 +110,40 @@ impl BlockCache {
         }
     }
 
+    /// Take a block only if it is already held.
+    ///
+    /// A caller that must do expensive work to prepare a decode can ask first
+    /// and skip that work on a hit.
+    pub fn peek(&self, index: u32, streaming: bool) -> Option<Arc<Vec<u8>>> {
+        let mut inner = self.lock();
+        let (was, bytes) = inner
+            .ready
+            .get(&index)
+            .map(|slot| ((slot.class, slot.used_at), Arc::clone(&slot.bytes)))?;
+        let now = inner.tick();
+        let class = class_of(streaming);
+        if was.0 != class {
+            if class == STREAMED {
+                inner.streamed += bytes.len();
+            } else {
+                inner.streamed -= bytes.len();
+            }
+        }
+        if let Some(slot) = inner.ready.get_mut(&index) {
+            slot.used_at = now;
+            slot.class = class;
+        }
+        inner.order.remove(&was);
+        inner.order.insert((class, now), index);
+        Some(bytes)
+    }
+
     /// Fetch a block, decoding it with `decode` only if no other caller is
     /// already doing so.
     ///
     /// The lock is released while decoding, so different blocks proceed in
     /// parallel. A failed decode wakes every waiter and leaves no entry, so a
     /// later call may retry.
-    /// Fetch a block, decoding it if no other caller already is.
     ///
     /// `streaming` marks a block wanted by a run of contiguous reads. Such a
     /// block is still cached, since consecutive reads land inside it, but it

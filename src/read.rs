@@ -939,10 +939,20 @@ impl<'i> Reader<'i> {
             }
         }
 
-        // A span block is decoded against the blocks before it in its span,
-        // which are fetched first so that no cache lookup happens inside a
-        // decode. The first block of a span never refers back, which bounds
-        // the walk at one span and makes a cycle unrepresentable.
+        // Rebuilding a span's context means walking back over the blocks
+        // before it, so ask the cache first: on a hit there is nothing to
+        // decode and nothing to rebuild. Doing this walk unconditionally made
+        // the cost of reading a cached block grow with its position in a span.
+        #[cfg(feature = "zstd")]
+        if e.codec == Codec::ZstdSpan
+            && let Some(held) = self.cache.peek(index, streaming)
+        {
+            return Ok(Block::Cached(held));
+        }
+
+        // The context is gathered before the decode so that no cache lookup
+        // happens inside one. The first block of a span never refers back,
+        // which bounds the walk at one span and makes a cycle unrepresentable.
         #[cfg(feature = "zstd")]
         let base = if e.codec == Codec::ZstdSpan {
             Some(self.span_context(index, streaming)?)
@@ -1017,14 +1027,31 @@ impl<'i> Reader<'i> {
                             let previous = base.ok_or(Error::Malformed {
                                 detail: "a span block has no preceding blocks to decode against",
                             })?;
-                            let mut d = self.phase(
+                            // Referencing the context as a prefix rather than
+                            // loading it as a dictionary costs the same
+                            // whatever its size, and produces identical bytes.
+                            let mut ctx = self.phase(
                                 |m| &m.dctx_ns,
-                                || zstd::bulk::Decompressor::with_dictionary(previous),
+                                || {
+                                    let mut ctx = zstd::zstd_safe::DCtx::create();
+                                    ctx.ref_prefix(previous).map(|_| ctx).map_err(|_| {
+                                        Error::Malformed {
+                                            detail: "a span block's context was refused",
+                                        }
+                                    })
+                                },
                             )?;
+                            let mut out = Vec::with_capacity(e.decoded_length as usize);
                             self.phase(
                                 |m| &m.decode_ns,
-                                || d.decompress(&raw, e.decoded_length as usize),
-                            )?
+                                || {
+                                    ctx.decompress(&mut out, &raw)
+                                        .map_err(|_| Error::Malformed {
+                                            detail: "a span block did not decode",
+                                        })
+                                },
+                            )?;
+                            out
                         }
                         #[cfg(not(feature = "zstd"))]
                         Codec::ZstdSpan => {

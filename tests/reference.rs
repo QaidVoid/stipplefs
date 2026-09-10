@@ -28,6 +28,7 @@ fn digest(b: &[u8]) -> u64 {
 struct Reference {
     image: Vec<u8>,
     block_size: u64,
+    span_width: usize,
     stream_length: u64,
     inode_count: u32,
     /// Every section, verified once when the image is opened.
@@ -64,6 +65,7 @@ impl Reference {
 
         Reference {
             block_size: u32at(&image, 32) as u64,
+            span_width: u32at(&image, 52) as usize,
             stream_length: u64at(&image, 24),
             inode_count: u32at(&image, 36),
             sections,
@@ -142,11 +144,17 @@ impl Reference {
                 d.decompress(raw, decoded_length).expect("zstd-dict block")
             }
             3 => {
-                // A span block is decoded against the block before it, which
-                // the format guarantees is not itself a span block.
-                assert!(index > 0, "block 0 cannot be a span block");
-                let base = self.decode_block(index - 1);
-                let mut d = zstd::bulk::Decompressor::with_dictionary(&base).unwrap();
+                // A span block is decoded against every block before it in its
+                // span. The first block of a span never refers back.
+                let width = self.span_width;
+                assert!(width >= 2, "span block in an image with no span width");
+                let start = index - index % width;
+                assert!(start < index, "the first block of a span cannot refer back");
+                let mut context = Vec::new();
+                for at in start..index {
+                    context.extend_from_slice(&self.decode_block(at));
+                }
+                let mut d = zstd::bulk::Decompressor::with_dictionary(&context).unwrap();
                 d.decompress(raw, decoded_length).expect("zstd-span block")
             }
             other => panic!("unknown codec {other}"),
@@ -360,6 +368,7 @@ fn every_writer_option_combination_round_trips() {
                                 codecs,
                                 threads,
                                 memory_limit,
+                                span_width: 4,
                                 level: 3,
                                 dictionary_size: 65536,
                                 timestamps,

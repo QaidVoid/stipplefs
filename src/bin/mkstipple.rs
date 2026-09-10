@@ -39,6 +39,11 @@ struct Args {
     /// below one block. Output does not depend on this.
     #[arg(long)]
     memory: Option<usize>,
+    /// Blocks per span. A block may be compressed against the blocks before it
+    /// in its span, which costs a reader one decode per block walked back.
+    /// One disables it.
+    #[arg(long, default_value_t = 4)]
+    span: u32,
     /// What to record for modification times. `preserve` keeps each entry's
     /// own time; `zero` records one fixed value, which is what makes two
     /// builds of the same content byte-identical across machines.
@@ -76,6 +81,7 @@ fn run(args: Args) -> Result<(), String> {
         },
         threads: args.threads.max(1),
         memory_limit: args.memory,
+        span_width: args.span,
         timestamps: match args.mtime {
             MtimePolicy::Preserve => Timestamps::Preserve,
             MtimePolicy::Zero => Timestamps::Clamp,

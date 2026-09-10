@@ -158,6 +158,12 @@ pub struct Superblock {
     pub block_count: u32,
     /// Inode number of the root directory.
     pub root_inode: u32,
+    /// Blocks per span, for the `zstd-span` codec.
+    ///
+    /// A span block is decoded against the blocks before it in its span, so
+    /// this is what tells a reader where to start. One, or zero in an image
+    /// written before spans existed, means no block refers to another.
+    pub span_width: u32,
     /// Where each section lives.
     pub sections: [Section; SECTION_COUNT],
 }

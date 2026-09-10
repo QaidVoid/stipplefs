@@ -152,6 +152,7 @@ pub(crate) fn parse_superblock(
         extent_count: u32at(bytes, 40),
         block_count: u32at(bytes, 44),
         root_inode: u32at(bytes, 48),
+        span_width: u32at(bytes, 52),
         sections,
     })
 }
@@ -887,6 +888,29 @@ impl<'i> Reader<'i> {
         false
     }
 
+    /// The bytes a span block was compressed against: every block from the
+    /// start of its span up to it.
+    #[cfg(feature = "zstd")]
+    fn span_context(&self, index: u32, streaming: bool) -> Result<Vec<u8>> {
+        let width = self.superblock.span_width;
+        if width < 2 {
+            return Err(Error::Malformed {
+                detail: "a span block in an image whose span width admits none",
+            });
+        }
+        let start = index - index % width;
+        if start == index {
+            return Err(Error::Malformed {
+                detail: "the first block of a span cannot refer to another",
+            });
+        }
+        let mut context = Vec::new();
+        for at in start..index {
+            context.extend_from_slice(&self.block(at, streaming)?);
+        }
+        Ok(context)
+    }
+
     fn block(&self, index: u32, streaming: bool) -> Result<Block<'_>> {
         self.note(|m| &m.block_fetches);
         if streaming {
@@ -915,25 +939,13 @@ impl<'i> Reader<'i> {
             }
         }
 
-        // A span block is decoded against the one before it, which is fetched
-        // first so that no cache lookup happens inside a decode. Its base is
-        // never itself a span block, so this recurses exactly once. Without a
-        // decompressor the image is refused at open, so there is nothing to
-        // fetch.
+        // A span block is decoded against the blocks before it in its span,
+        // which are fetched first so that no cache lookup happens inside a
+        // decode. The first block of a span never refers back, which bounds
+        // the walk at one span and makes a cycle unrepresentable.
         #[cfg(feature = "zstd")]
         let base = if e.codec == Codec::ZstdSpan {
-            let previous = index.checked_sub(1).ok_or(Error::Malformed {
-                detail: "the first block cannot refer to a preceding one",
-            })?;
-            let entry = self.blocks.get(previous).ok_or(Error::Malformed {
-                detail: "a span block refers outside the block index",
-            })?;
-            if entry.codec == Codec::ZstdSpan {
-                return Err(Error::Malformed {
-                    detail: "a span block refers to another span block",
-                });
-            }
-            Some(self.block(previous, streaming)?)
+            Some(self.span_context(index, streaming)?)
         } else {
             None
         };
@@ -1003,7 +1015,7 @@ impl<'i> Reader<'i> {
                         #[cfg(feature = "zstd")]
                         Codec::ZstdSpan => {
                             let previous = base.ok_or(Error::Malformed {
-                                detail: "a span block has no preceding block to decode against",
+                                detail: "a span block has no preceding blocks to decode against",
                             })?;
                             let mut d = self.phase(
                                 |m| &m.dctx_ns,

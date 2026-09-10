@@ -18,6 +18,12 @@ use crate::format::{
 
 use std::collections::{BTreeMap, HashMap};
 
+/// Most blocks a span may hold.
+///
+/// A reader walks back to the start of a span to rebuild the bytes a block was
+/// compressed against, so this bounds that walk.
+pub const MAX_SPAN_WIDTH: u32 = 64;
+
 /// Lowest compression level a caller may ask for.
 pub const MIN_LEVEL: i32 = 1;
 
@@ -46,6 +52,10 @@ pub struct Options {
     /// Rough ceiling on the memory used to compress blocks, in bytes. `None`
     /// lets every worker hold a block. Output does not depend on this.
     pub memory_limit: Option<usize>,
+    /// Blocks per span. A block may be compressed against the blocks before it
+    /// in its span, which costs a reader one decode per block it has to walk
+    /// back. One disables the behaviour.
+    pub span_width: u32,
     /// What to record for modification times.
     pub timestamps: Timestamps,
 }
@@ -75,6 +85,7 @@ impl Default for Options {
             dictionary_size: 112 * 1024,
             threads: 1,
             memory_limit: None,
+            span_width: 4,
             timestamps: Timestamps::default(),
         }
     }
@@ -257,6 +268,14 @@ impl Builder {
         if options.codecs & Codec::Stored.bit() == 0 {
             return Err(Error::Malformed {
                 detail: "the stored codec cannot be excluded",
+            });
+        }
+        if options.span_width == 0
+            || !options.span_width.is_power_of_two()
+            || options.span_width > MAX_SPAN_WIDTH
+        {
+            return Err(Error::Malformed {
+                detail: "span width must be a power of two from one to sixty four",
             });
         }
         if !(MIN_LEVEL..=MAX_LEVEL).contains(&options.level) {
@@ -923,15 +942,28 @@ impl Builder {
         &self,
         blocks: &[&[u8]],
         dict: Option<&[u8]>,
-        prior: Option<&[u8]>,
-        prior_refers: bool,
-    ) -> (Vec<(Codec, Vec<u8>)>, bool) {
-        let base_for =
-            |j: usize| -> Option<&[u8]> { if j > 0 { Some(blocks[j - 1]) } else { prior } };
+        first_index: usize,
+    ) -> Vec<(Codec, Vec<u8>)> {
+        // A block is compressed against everything before it in its span. The
+        // first block of a span has nothing to refer to and stands alone,
+        // which is what stops a reader walking back indefinitely.
+        let width = self.options.span_width as usize;
+        let context_for = |j: usize| -> Option<Vec<u8>> {
+            let absolute = first_index + j;
+            let start = absolute - absolute % width;
+            if start == absolute {
+                return None;
+            }
+            let mut context = Vec::new();
+            for at in start..absolute {
+                context.extend_from_slice(blocks[at - first_index]);
+            }
+            Some(context)
+        };
         let one = |j: usize| -> Candidate {
             Candidate {
                 alone: self.encode_block(blocks[j], dict),
-                against_previous: base_for(j).and_then(|b| self.encode_span(blocks[j], b)),
+                against_previous: context_for(j).and_then(|c| self.encode_span(blocks[j], &c)),
             }
         };
 
@@ -962,21 +994,16 @@ impl Builder {
             collected.into_iter().flatten().collect()
         };
 
-        let mut refers = prior_refers;
         let mut out = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             match candidate.against_previous {
-                Some(z) if !refers && z.len() < candidate.alone.1.len() => {
-                    refers = true;
+                Some(z) if z.len() < candidate.alone.1.len() => {
                     out.push((Codec::ZstdSpan, z));
                 }
-                _ => {
-                    refers = false;
-                    out.push(candidate.alone);
-                }
+                _ => out.push(candidate.alone),
             }
         }
-        (out, refers)
+        out
     }
 
     /// Compress `raw` against the preceding block's bytes, if that codec is
@@ -1143,6 +1170,7 @@ impl Builder {
         sb[40..44].copy_from_slice(&(plan.extents.len() as u32).to_le_bytes());
         sb[44..48].copy_from_slice(&(blocks.len() as u32).to_le_bytes());
         sb[48..52].copy_from_slice(&0u32.to_le_bytes());
+        sb[52..56].copy_from_slice(&self.options.span_width.to_le_bytes());
         for (i, (off, size)) in placed.iter().enumerate() {
             let base = 56 + i * 16;
             sb[base..base + 8].copy_from_slice(&off.to_le_bytes());
@@ -1190,8 +1218,6 @@ impl Builder {
         let stream_len = stream.len;
         let batch = self.batch_size(block_size);
         let mut blocks = Vec::with_capacity(block_count);
-        let mut prior: Option<Vec<u8>> = None;
-        let mut prior_refers = false;
         let mut index = 0;
         while index < block_count {
             let n = batch.min(block_count - index);
@@ -1204,10 +1230,7 @@ impl Builder {
                 raw.push(b);
             }
             let refs: Vec<&[u8]> = raw.iter().map(|b| b.as_slice()).collect();
-            let (encoded, last_refers) =
-                self.encode_blocks(&refs, dict, prior.as_deref(), prior_refers);
-            prior_refers = last_refers;
-            prior = raw.last().cloned();
+            let encoded = self.encode_blocks(&refs, dict, index);
             for ((codec, enc), decoded) in encoded.iter().zip(&raw) {
                 blocks.push(EncodedBlock {
                     codec: *codec,
@@ -1233,9 +1256,10 @@ impl Builder {
             None => threads,
             Some(limit) => (limit / block_size.max(1) / 2).clamp(1, threads),
         };
-        // Batches start on even blocks, so an even size keeps every span
-        // block's base in the same batch as the block itself.
-        want.next_multiple_of(2)
+        // A run of blocks must hold whole spans, so that the bytes a block was
+        // compressed against are always in the same run and the output does
+        // not depend on where the runs were cut.
+        want.next_multiple_of(self.options.span_width as usize)
     }
 }
 

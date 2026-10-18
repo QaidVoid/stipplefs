@@ -46,8 +46,20 @@ pub struct Options {
     /// Rough ceiling on the memory used to compress blocks, in bytes. `None`
     /// lets every worker hold a block. Output does not depend on this.
     pub memory_limit: Option<usize>,
+    /// How files are ordered in the stream before chunking.
+    pub order: FileOrder,
     /// What to record for modification times.
     pub timestamps: Timestamps,
+}
+
+/// How files are ordered in the stream before chunking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileOrder {
+    /// Pre-order tree walk order (format canonical default).
+    #[default]
+    Walk,
+    /// Group files by extension and filename.
+    Extension,
 }
 
 /// What the writer records for modification times.
@@ -72,6 +84,7 @@ impl Default for Options {
             dictionary_size: 112 * 1024,
             threads: 1,
             memory_limit: None,
+            order: FileOrder::default(),
             timestamps: Timestamps::default(),
         }
     }
@@ -492,6 +505,23 @@ impl Builder {
         let root = plan.alloc();
         let mut placements = Vec::new();
         self.visit(&self.root, root, &mut plan, &[], &mut placements)?;
+
+        if self.options.order == FileOrder::Extension {
+            placements.sort_by(|a, b| {
+                let key_a = match &a.1 {
+                    Pending::Bytes(_) => (None, None),
+                    #[cfg(feature = "fs")]
+                    Pending::Path(p) => (p.extension(), p.file_name()),
+                };
+                let key_b = match &b.1 {
+                    Pending::Bytes(_) => (None, None),
+                    #[cfg(feature = "fs")]
+                    Pending::Path(p) => (p.extension(), p.file_name()),
+                };
+                key_a.cmp(&key_b)
+            });
+        }
+
         self.place_all(&placements, &mut plan, &cfg)?;
 
         let mut counts = vec![0u32; plan.inodes.len()];

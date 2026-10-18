@@ -38,9 +38,12 @@ enum Command {
     Bench {
         #[command(flatten)]
         image: Located,
-        /// Random 4 KiB reads to perform.
+        /// Random reads to perform.
         #[arg(long, default_value_t = 2000)]
         reads: usize,
+        /// Size of each read in bytes.
+        #[arg(long, default_value_t = 4096)]
+        read_size: usize,
         /// Seed, so a run can be repeated exactly.
         #[arg(long, default_value_t = 20260908)]
         seed: u64,
@@ -245,6 +248,7 @@ fn check(located: Located) -> Result<(), String> {
     let mut block_devices = 0u64;
     let mut bytes = 0u64;
     let mut checked = 0u64;
+    let t_verify = std::time::Instant::now();
     walk(&reader, 0, Path::new(""), &mut |_, ino| {
         let node = reader.inode(ino).ok_or("inode out of range")?;
         match node.file_type() {
@@ -317,7 +321,9 @@ fn check(located: Located) -> Result<(), String> {
     println!("sockets         {sockets}");
     println!("char devices    {char_devices}");
     println!("block devices   {block_devices}");
-    println!("verified        {checked} bytes read and checksummed");
+    let verify_elapsed = t_verify.elapsed();
+    let mb_s = (checked as f64 / (1024.0 * 1024.0)) / verify_elapsed.as_secs_f64();
+    println!("verified        {checked} bytes read and checksummed in {:.3} s ({:.1} MB/s)", verify_elapsed.as_secs_f64(), mb_s);
     Ok(())
 }
 
@@ -446,7 +452,8 @@ fn mount(
     fuser::mount(fs, &mountpoint, &config).map_err(|e| format!("mounting: {e}"))
 }
 
-fn bench(located: Located, reads: usize, seed: u64) -> Result<(), String> {
+fn bench(located: Located, reads: usize, read_size: usize, seed: u64) -> Result<(), String> {
+    let t_open = std::time::Instant::now();
     let image = located.open()?;
     let budget = located
         .cache_budget
@@ -454,23 +461,22 @@ fn bench(located: Located, reads: usize, seed: u64) -> Result<(), String> {
     let reader = image
         .reader_with_budget(budget)
         .map_err(|e| e.to_string())?;
+    let open_elapsed = t_open.elapsed();
 
     let mut files: Vec<(u32, u64)> = Vec::new();
     walk(&reader, 0, Path::new(""), &mut |_, ino| {
         if let Some(node) = reader.inode(ino)
             && node.file_type() == Some(FileType::Regular)
-            && node.size >= 4096
+            && node.size >= read_size as u64
         {
             files.push((ino, node.size));
         }
         Ok(())
     })?;
     if files.is_empty() {
-        return Err("no files of at least 4 KiB in the image".into());
+        return Err(format!("no files of at least {read_size} B in the image"));
     }
 
-    // The same cheap generator the external harness uses, so the two are
-    // reading comparable distributions.
     let mut state = seed | 1;
     let mut next = move || {
         state ^= state << 13;
@@ -481,28 +487,67 @@ fn bench(located: Located, reads: usize, seed: u64) -> Result<(), String> {
     let picks: Vec<(u32, u64)> = (0..reads)
         .map(|_| {
             let (ino, size) = files[(next() % files.len() as u64) as usize];
-            (ino, (next() % (size - 4096).max(1)) & !4095)
+            (ino, (next() % (size - read_size as u64).max(1)) & !4095)
         })
         .collect();
 
-    let mut buf = [0u8; 4096];
+    let mut buf = vec![0u8; read_size];
+
+    // Measure cold reads
+    let mut cold_latencies = Vec::with_capacity(reads);
     let mut got = 0u64;
-    let start = std::time::Instant::now();
-    for (ino, offset) in &picks {
-        got += reader
+    let t_first = std::time::Instant::now();
+    let mut first_read_elapsed = None;
+
+    let start_cold = std::time::Instant::now();
+    for (i, (ino, offset)) in picks.iter().enumerate() {
+        let t0 = std::time::Instant::now();
+        let n = reader
             .read(*ino, *offset, &mut buf)
-            .map_err(|e| e.to_string())? as u64;
+            .map_err(|e| e.to_string())?;
+        let lat = t0.elapsed();
+        if i == 0 {
+            first_read_elapsed = Some(t_first.elapsed());
+        }
+        got += n as u64;
+        cold_latencies.push(lat);
     }
-    let elapsed = start.elapsed();
+    let elapsed_cold = start_cold.elapsed();
+
+    // Measure warm reads (run same picks again on warm cache)
+    let mut warm_latencies = Vec::with_capacity(reads);
+    let start_warm = std::time::Instant::now();
+    for (ino, offset) in &picks {
+        let t0 = std::time::Instant::now();
+        let _ = reader
+            .read(*ino, *offset, &mut buf)
+            .map_err(|e| e.to_string())?;
+        warm_latencies.push(t0.elapsed());
+    }
+    let elapsed_warm = start_warm.elapsed();
+
+    cold_latencies.sort();
+    warm_latencies.sort();
+
+    let p = |l: &[std::time::Duration], pct: usize| -> f64 {
+        if l.is_empty() { return 0.0; }
+        let idx = (l.len() * pct / 100).min(l.len() - 1);
+        l[idx].as_secs_f64() * 1e6 // in microseconds
+    };
 
     println!("files eligible {}", files.len());
-    println!("reads          {reads}");
+    println!("reads          {reads} (size {read_size} B)");
     println!("bytes          {got}");
-    println!("elapsed        {:.3} s", elapsed.as_secs_f64());
-    println!(
-        "rate           {:.1} reads/s",
-        reads as f64 / elapsed.as_secs_f64()
-    );
+    println!("open time      {:.3} ms", open_elapsed.as_secs_f64() * 1e3);
+    println!("first read     {:.3} ms", first_read_elapsed.unwrap_or_default().as_secs_f64() * 1e3);
+    println!("cold elapsed   {:.3} s ({:.1} reads/s)", elapsed_cold.as_secs_f64(), reads as f64 / elapsed_cold.as_secs_f64());
+    println!("cold p50       {:.1} us", p(&cold_latencies, 50));
+    println!("cold p90       {:.1} us", p(&cold_latencies, 90));
+    println!("cold p99       {:.1} us", p(&cold_latencies, 99));
+    println!("warm elapsed   {:.3} s ({:.1} reads/s)", elapsed_warm.as_secs_f64(), reads as f64 / elapsed_warm.as_secs_f64());
+    println!("warm p50       {:.1} us", p(&warm_latencies, 50));
+    println!("warm p90       {:.1} us", p(&warm_latencies, 90));
+    println!("warm p99       {:.1} us", p(&warm_latencies, 99));
     println!();
     print!("{}", reader.metrics().report());
     Ok(())
@@ -512,7 +557,7 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let outcome = match args.command {
         Command::Check(located) => check(located),
-        Command::Bench { image, reads, seed } => bench(image, reads, seed),
+        Command::Bench { image, reads, read_size, seed } => bench(image, reads, read_size, seed),
         #[cfg(feature = "mount")]
         Command::Mount {
             image,

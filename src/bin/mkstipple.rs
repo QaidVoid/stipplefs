@@ -44,6 +44,18 @@ struct Args {
     /// builds of the same content byte-identical across machines.
     #[arg(long, value_enum, default_value_t = MtimePolicy::Preserve)]
     mtime: MtimePolicy,
+    /// How to order files before placing them into the stream.
+    #[arg(long, value_enum, default_value_t = OrderArg::Walk)]
+    order: OrderArg,
+}
+
+/// How `--order` is spelled on the command line.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OrderArg {
+    /// Pre-order tree walk order (format canonical default).
+    Walk,
+    /// Group files by extension and filename.
+    Ext,
 }
 
 /// How `--mtime` is spelled on the command line.
@@ -76,6 +88,10 @@ fn run(args: Args) -> Result<(), String> {
         },
         threads: args.threads.max(1),
         memory_limit: args.memory,
+        order: match args.order {
+            OrderArg::Walk => stipplefs::write::FileOrder::Walk,
+            OrderArg::Ext => stipplefs::write::FileOrder::Extension,
+        },
         timestamps: match args.mtime {
             MtimePolicy::Preserve => Timestamps::Preserve,
             MtimePolicy::Zero => Timestamps::Clamp,

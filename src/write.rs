@@ -46,8 +46,6 @@ pub struct Options {
     /// Rough ceiling on the memory used to compress blocks, in bytes. `None`
     /// lets every worker hold a block. Output does not depend on this.
     pub memory_limit: Option<usize>,
-    /// How files are ordered in the stream before chunking.
-    pub order: FileOrder,
     /// What to record for modification times.
     pub timestamps: Timestamps,
 }
@@ -84,7 +82,6 @@ impl Default for Options {
             dictionary_size: 112 * 1024,
             threads: 1,
             memory_limit: None,
-            order: FileOrder::default(),
             timestamps: Timestamps::default(),
         }
     }
@@ -244,6 +241,7 @@ pub type XattrSet = Vec<Xattr>;
 /// Collects a tree and turns it into an image.
 pub struct Builder {
     options: Options,
+    order: FileOrder,
     root: Dir,
     /// Extended attributes, keyed by the same path used to insert the entry.
     /// Kept beside the tree rather than inside every node kind, since any kind
@@ -276,6 +274,7 @@ impl Builder {
         }
         Ok(Builder {
             options,
+            order: FileOrder::default(),
             root: Dir {
                 mode: 0o755,
                 ..Dir::default()
@@ -283,6 +282,11 @@ impl Builder {
             xattrs: BTreeMap::new(),
             mtimes: BTreeMap::new(),
         })
+    }
+
+    /// Set how files are ordered in the stream before chunking.
+    pub fn set_order(&mut self, order: FileOrder) {
+        self.order = order;
     }
 
     /// Record a modification time for the entry at `path`, in seconds.
@@ -506,7 +510,7 @@ impl Builder {
         let mut placements = Vec::new();
         self.visit(&self.root, root, &mut plan, &[], &mut placements)?;
 
-        if self.options.order == FileOrder::Extension {
+        if self.order == FileOrder::Extension {
             placements.sort_by(|a, b| {
                 let key_a = match &a.1 {
                     Pending::Bytes(_) => (None, None),

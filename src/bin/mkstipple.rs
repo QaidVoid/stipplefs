@@ -88,10 +88,6 @@ fn run(args: Args) -> Result<(), String> {
         },
         threads: args.threads.max(1),
         memory_limit: args.memory,
-        order: match args.order {
-            OrderArg::Walk => stipplefs::write::FileOrder::Walk,
-            OrderArg::Ext => stipplefs::write::FileOrder::Extension,
-        },
         timestamps: match args.mtime {
             MtimePolicy::Preserve => Timestamps::Preserve,
             MtimePolicy::Zero => Timestamps::Clamp,
@@ -99,6 +95,10 @@ fn run(args: Args) -> Result<(), String> {
     };
 
     let mut builder = Builder::new(options).map_err(|e| e.to_string())?;
+    builder.set_order(match args.order {
+        OrderArg::Walk => stipplefs::write::FileOrder::Walk,
+        OrderArg::Ext => stipplefs::write::FileOrder::Extension,
+    });
     builder
         .add_tree(&args.source)
         .map_err(|e| format!("reading {}: {e}", args.source.display()))?;

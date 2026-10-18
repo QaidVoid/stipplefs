@@ -801,22 +801,25 @@ impl Builder {
     }
 }
 
-/// A scratch file holding the logical stream, and then the encoded blocks,
+/// Scratch files holding the logical stream, and then the encoded blocks,
 /// while an image is built.
 ///
 /// Both are written once and read back once, which is what keeps the writer's
-/// memory independent of the size of the tree being packed. The file is
-/// unlinked as soon as it is open, so it costs nothing if the process dies.
+/// memory independent of the size of the tree being packed. The stream is split
+/// across files of a bounded size, so a large tree stays within whatever limit
+/// the scratch filesystem puts on one file. Each is unlinked as soon as it is
+/// open, so it costs nothing if the process dies.
 struct Spill {
-    file: std::fs::File,
+    files: Vec<std::fs::File>,
     buffer: Vec<u8>,
     len: u64,
 }
 
 impl Spill {
     const BUFFER: usize = 1 << 20;
+    const SHARD_SIZE: u64 = 256 * 1024 * 1024;
 
-    fn create() -> Result<Self> {
+    fn new_shard_file() -> Result<std::fs::File> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -834,8 +837,13 @@ impl Spill {
             .open(&path)
             .map_err(fail)?;
         std::fs::remove_file(&path).map_err(fail)?;
+        Ok(file)
+    }
+
+    fn create() -> Result<Self> {
+        let first = Self::new_shard_file()?;
         Ok(Spill {
-            file,
+            files: vec![first],
             buffer: Vec::with_capacity(Self::BUFFER),
             len: 0,
         })
@@ -843,13 +851,12 @@ impl Spill {
 
     /// Append `bytes` and return the offset they were written at.
     fn append(&mut self, bytes: &[u8]) -> Result<u64> {
-        use std::io::Write;
         let at = self.len;
         if self.buffer.len() + bytes.len() > Self::BUFFER {
             self.flush()?;
         }
         if bytes.len() >= Self::BUFFER {
-            self.file.write_all(bytes)?;
+            self.write_sharded(self.len, bytes)?;
         } else {
             self.buffer.extend_from_slice(bytes);
         }
@@ -857,19 +864,59 @@ impl Spill {
         Ok(at)
     }
 
-    fn flush(&mut self) -> Result<()> {
-        use std::io::Write;
-        if !self.buffer.is_empty() {
-            self.file.write_all(&self.buffer)?;
-            self.buffer.clear();
+    /// The shard holding stream offset `at`, the offset within it, and how
+    /// many bytes that shard has from there.
+    fn locate(at: u64) -> (usize, u64, usize) {
+        let within = at % Self::SHARD_SIZE;
+        (
+            (at / Self::SHARD_SIZE) as usize,
+            within,
+            (Self::SHARD_SIZE - within) as usize,
+        )
+    }
+
+    fn write_sharded(&mut self, mut at: u64, mut bytes: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        while !bytes.is_empty() {
+            let (shard, within, left) = Self::locate(at);
+            while self.files.len() <= shard {
+                self.files.push(Self::new_shard_file()?);
+            }
+            let take = bytes.len().min(left);
+            self.files[shard].write_all_at(&bytes[..take], within)?;
+            at += take as u64;
+            bytes = &bytes[take..];
         }
         Ok(())
     }
 
+    fn flush(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let start = self.len - self.buffer.len() as u64;
+        // Taken and put back, so the buffer keeps its capacity.
+        let mut bytes = std::mem::take(&mut self.buffer);
+        let written = self.write_sharded(start, &bytes);
+        bytes.clear();
+        self.buffer = bytes;
+        written
+    }
+
     /// Fill `buf` from `at`. Everything read must already have been flushed.
-    fn read_at(&self, at: u64, buf: &mut [u8]) -> Result<()> {
+    fn read_at(&self, mut at: u64, mut buf: &mut [u8]) -> Result<()> {
         use std::os::unix::fs::FileExt;
-        self.file.read_exact_at(buf, at)?;
+        while !buf.is_empty() {
+            let (shard, within, left) = Self::locate(at);
+            let file = self.files.get(shard).ok_or_else(|| Error::Temporary {
+                directory: "scratch".into(),
+                detail: "a read reaches past the scratch stream".into(),
+            })?;
+            let take = buf.len().min(left);
+            file.read_exact_at(&mut buf[..take], within)?;
+            at += take as u64;
+            buf = &mut buf[take..];
+        }
         Ok(())
     }
 }

@@ -10,6 +10,9 @@
 pub mod error;
 pub mod format;
 
+/// The x86 BCJ pre-filter used by the executable-aware codecs.
+pub mod bcj;
+
 #[cfg(feature = "read")]
 pub mod cache;
 

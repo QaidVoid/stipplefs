@@ -151,6 +151,62 @@ fn the_fixture_exercises_every_path_that_could_vary() {
         codecs.len() > 1,
         "only one codec used, so codec selection is untested: {codecs:?}"
     );
+
+    // The default image must exercise both new format features, or the paths
+    // that write them are untested here.
+    assert_ne!(
+        sb.flags & stipplefs::format::FLAG_COMPRESSED_METADATA,
+        0,
+        "metadata is not compressed by default"
+    );
+}
+
+#[test]
+fn x86_shaped_content_selects_a_bcj_codec_deterministically() {
+    use stipplefs::format::Codec;
+
+    let tree = || {
+        let mut code = Vec::new();
+        for p in (0..(64 << 10)).step_by(8) {
+            let rel = 0x1000i32 - (p + 5);
+            code.push(0xE8u8);
+            code.extend_from_slice(&rel.to_le_bytes());
+            code.extend_from_slice(&[0x90, 0x90, 0x90]);
+        }
+        let mut b = Builder::new(Options::default()).unwrap();
+        b.insert(
+            b"code.bin",
+            Node::File {
+                content: code,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                link_group: None,
+            },
+        )
+        .unwrap();
+        b.build().unwrap()
+    };
+
+    let first = tree();
+    let second = tree();
+    assert_eq!(first, second, "BCJ blocks are not deterministic");
+
+    let img = stipplefs::read::Image::new(first.clone(), 0, first.len() as u64).unwrap();
+    let sb = *img.superblock();
+    assert_ne!(
+        sb.codec_mask & (Codec::ZstdBcj.bit() | Codec::ZstdDictBcj.bit()),
+        0,
+        "x86-shaped content did not select a BCJ codec: mask {:#06x}",
+        sb.codec_mask
+    );
+
+    let r = img.reader().unwrap();
+    let ino = r.resolve(b"code.bin").unwrap();
+    let want = r.inode(ino).unwrap().size as usize;
+    let mut buf = vec![0u8; want];
+    assert_eq!(r.read(ino, 0, &mut buf).unwrap(), want);
+    assert_eq!(buf[..8], [0xE8, 0xFB, 0x0F, 0, 0, 0x90, 0x90, 0x90]);
 }
 
 #[test]

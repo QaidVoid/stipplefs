@@ -13,7 +13,9 @@ pub const ALIGNMENT: u64 = 4096;
 pub const VERSION_MAJOR: u16 = 1;
 
 /// Minor format version this build writes.
-pub const VERSION_MINOR: u16 = 1;
+///
+/// 2 adds the BCJ-filtered codecs and the compressed-metadata flag.
+pub const VERSION_MINOR: u16 = 2;
 
 /// Lowest minor version this build can read.
 ///
@@ -56,6 +58,24 @@ pub enum SectionKind {
     ExtendedAttributes = 7,
 }
 
+impl SectionKind {
+    /// Whether an image may store this section as a compressed frame.
+    ///
+    /// The block index records the offsets of the data blocks that follow it,
+    /// so compressing it would make the layout depend on the compressed size
+    /// of a section whose content depends on the layout. The dictionary is
+    /// close to incompressible itself. Everything else may be compressed when
+    /// the superblock says so.
+    pub const fn is_compressible(self) -> bool {
+        !matches!(self, SectionKind::Blocks | SectionKind::Dictionaries)
+    }
+}
+
+/// Superblock flag: every present section for which
+/// [`SectionKind::is_compressible`] holds is stored as a zstd frame, prefixed
+/// by its decoded length. See `docs/format.md`.
+pub const FLAG_COMPRESSED_METADATA: u16 = 0x0001;
+
 /// How a block's bytes are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -65,6 +85,11 @@ pub enum Codec {
     Zstd,
     /// Zstandard frame using the image's dictionary.
     ZstdDict,
+    /// Zstandard frame with no dictionary, over BCJ-filtered x86 bytes.
+    ZstdBcj,
+    /// Zstandard frame using the image's dictionary, over BCJ-filtered x86
+    /// bytes.
+    ZstdDictBcj,
 }
 
 impl Codec {
@@ -74,6 +99,8 @@ impl Codec {
             0 => Some(Codec::Stored),
             1 => Some(Codec::Zstd),
             2 => Some(Codec::ZstdDict),
+            3 => Some(Codec::ZstdBcj),
+            4 => Some(Codec::ZstdDictBcj),
             _ => None,
         }
     }
@@ -84,6 +111,8 @@ impl Codec {
             Codec::Stored => 0,
             Codec::Zstd => 1,
             Codec::ZstdDict => 2,
+            Codec::ZstdBcj => 3,
+            Codec::ZstdDictBcj => 4,
         }
     }
 
@@ -91,7 +120,23 @@ impl Codec {
     pub const fn bit(self) -> u16 {
         1 << self.id()
     }
+
+    /// Whether the codec's payload is BCJ-filtered before compression.
+    pub const fn is_bcj(self) -> bool {
+        matches!(self, Codec::ZstdBcj | Codec::ZstdDictBcj)
+    }
+
+    /// Whether the codec decodes against the image's dictionary.
+    pub const fn needs_dictionary(self) -> bool {
+        matches!(self, Codec::ZstdDict | Codec::ZstdDictBcj)
+    }
 }
+
+/// Bitmask of every codec identifier the format defines.
+pub const KNOWN_CODEC_BITS: u16 = (1 << (Codec::ZstdDictBcj.id() as u16 + 1)) - 1;
+
+/// Bitmask of every superblock flag the format defines.
+pub const KNOWN_FLAG_BITS: u16 = FLAG_COMPRESSED_METADATA;
 
 /// Codecs this build can decode.
 ///
@@ -104,6 +149,8 @@ pub const fn supported_codecs() -> u16 {
     {
         mask |= Codec::Zstd.bit();
         mask |= Codec::ZstdDict.bit();
+        mask |= Codec::ZstdBcj.bit();
+        mask |= Codec::ZstdDictBcj.bit();
     }
     mask
 }
@@ -131,7 +178,7 @@ pub struct Superblock {
     pub version_major: u16,
     /// Minor format version.
     pub version_minor: u16,
-    /// Reserved in version 1.0.
+    /// [`FLAG_COMPRESSED_METADATA`] and, in later versions, further bits.
     pub flags: u16,
     /// Bitmask of every codec used anywhere in the image.
     pub codec_mask: u16,

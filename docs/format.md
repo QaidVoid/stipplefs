@@ -1,4 +1,4 @@
-# The stipplefs image format, version 1.0
+# The stipplefs image format, version 1.2
 
 This document defines the on-disk format completely enough to write an
 independent reader. It is normative: where it says SHALL, a conforming reader
@@ -21,7 +21,8 @@ rejects an image that violates the rule.
 | Superblock                                 [4096] |
 +--------------------------------------------------+
 | Metadata sections (inodes, dirents, names,        |
-| extents, block index, dictionaries)               |
+| extents, attributes, extended attributes, block   |
+| index, dictionaries)                              |
 +--------------------------------------------------+
 | Data blocks                                       |
 +--------------------------------------------------+ offset image_length
@@ -40,9 +41,9 @@ Occupies exactly 4096 bytes at image offset 0.
 |---|---|---|---|
 | 0 | 8 | `magic` | ASCII `STIPPLE\0`, bytes `53 54 49 50 50 4C 45 00` |
 | 8 | 2 | `version_major` | `1` for this document |
-| 10 | 2 | `version_minor` | `1` for this document |
-| 12 | 2 | `flags` | reserved, zero in version 1.0 |
-| 14 | 2 | `codec_mask` | bitmask of every codec used anywhere in the image |
+| 10 | 2 | `version_minor` | `2` for this document |
+| 12 | 2 | `flags` | superblock flags, see below |
+| 14 | 2 | `codec_mask` | bitmask of the block codecs used in the image |
 | 16 | 8 | `image_length` | total size of the image in bytes |
 | 24 | 8 | `stream_length` | total length of the logical stream |
 | 32 | 4 | `block_size` | decoded size of a full block, a power of two |
@@ -51,9 +52,19 @@ Occupies exactly 4096 bytes at image offset 0.
 | 44 | 4 | `block_count` | number of entries in the block index |
 | 48 | 4 | `root_inode` | inode number of the root directory |
 | 52 | 4 | reserved | zero |
-| 56 | 8x2 x 8 | `sections` | eight `(offset, length)` pairs, see below |
+| 56 | 128 | `sections` | eight `(offset, length)` pairs, see below |
 | 184 | 3904 | reserved | zero |
 | 4088 | 8 | `checksum` | `xxh3-64` over bytes `[0, 4088)` |
+
+### Superblock flags
+
+| Bit | Name | Meaning |
+|---|---|---|
+| `0x0001` | `FLAG_COMPRESSED_METADATA` | present compressible metadata sections are stored as compressed frames |
+
+Every other bit is reserved and SHALL be zero. A reader SHALL reject an image
+whose `flags` contains a bit it does not implement. A reader SHALL reject
+`FLAG_COMPRESSED_METADATA` on an image whose `version_minor` is below 2.
 
 ### Section table
 
@@ -70,22 +81,27 @@ Eight `(offset [8], length [8])` pairs, in this fixed order:
 | 6 | attribute table |
 | 7 | extended attributes |
 
-A section with `length == 0` is absent and its `offset` SHALL be zero.
+A section with `length == 0` is absent and its `offset` SHALL be zero. The
+indices are the order of the pairs in the superblock, not necessarily the order
+the sections appear in the image. See Canonical encoding.
 
 A reader SHALL reject the image unless all of the following hold:
 
 1. `magic` matches.
-2. `version_major == 1`, and `version_minor` is at least the lowest the reader
-   implements. A greater `version_minor` is accepted. The inode table's layout
-   changed at minor version 1, and no reader can interpret both, so a reader
-   implementing this document rejects minor version 0.
+2. `version_major == 1`, and `version_minor` is at least 1. A greater
+   `version_minor` is accepted. The inode table's layout changed at minor
+   version 1, and no reader can interpret both, so a reader implementing this
+   document rejects minor version 0.
 3. `checksum` matches the computed digest.
-4. `image_length` is a multiple of 4096 and does not exceed the range the
-   caller supplied.
+4. `image_length` is a non-zero multiple of 4096 and does not exceed the range
+   the caller supplied.
 5. `block_size` is a power of two, at least 4096 and at most 2^31.
 6. Every present section lies entirely within `[4096, image_length)`.
 7. No two present sections overlap.
-8. Every bit set in `codec_mask` names a codec the reader implements.
+8. Every bit set in `codec_mask` names a codec this document defines and the
+   reader implements.
+9. No bit is set in `flags` outside the flags this document defines.
+10. `FLAG_COMPRESSED_METADATA` is clear when `version_minor` is below 2.
 
 Rule 8 is what makes an unsupported codec fail at open rather than at the first
 affected read.
@@ -97,10 +113,122 @@ affected read.
 | 0 | `0x0001` | `stored` | block bytes are the decoded bytes |
 | 1 | `0x0002` | `zstd` | Zstandard frame, no dictionary |
 | 2 | `0x0004` | `zstd-dict` | Zstandard frame using the image's dictionary |
+| 3 | `0x0008` | `zstd-bcj` | Zstandard frame, no dictionary, over BCJ-filtered x86 bytes |
+| 4 | `0x0010` | `zstd-dict-bcj` | Zstandard frame using the image's dictionary, over BCJ-filtered x86 bytes |
 
-`codec_mask` SHALL have exactly the bits of the codecs actually used. A reader
-that does not implement `zstd` may still open an image whose `codec_mask` is
-`0x0001`.
+Codecs 3 and 4, and `FLAG_COMPRESSED_METADATA`, are defined from minor
+version 2.
+
+`codec_mask` is a bitmask of the block codecs used in the image. Every block's
+`codec` bit SHALL be set in `codec_mask`. A reader SHALL reject a mask that
+contains a bit the format does not define, or a bit for a codec the reader does
+not implement. A mask that contains a supported codec no block uses is valid;
+the writer always sets the `stored` bit. Metadata compression is signalled by
+`FLAG_COMPRESSED_METADATA`, not by `codec_mask`.
+
+Codecs 3 and 4 apply the BCJ transform described below. A reader that does not
+implement `zstd` can read an image whose `codec_mask` is `0x0001` when
+`FLAG_COMPRESSED_METADATA` is clear. When the flag is set and a compressible
+section is present, the reader cannot expand it and SHALL refuse the image.
+
+## BCJ transform
+
+Codecs 3 and 4 apply the x86 BCJ filter from xz's `simple/x86.c` (0BSD; Igor
+Pavlov and Lasse Collin) to the block's decoded bytes. On encode, the block's
+bytes are filtered before the Zstandard frame is produced. On decode, the frame
+is expanded and the filter's decoder direction is applied to the result.
+
+The encoder direction converts relative call and jump displacements to absolute
+targets; the decoder direction converts absolute targets back to relative
+displacements. The transform is length-preserving.
+
+Positions are block-relative and start at zero for every block. Filter state
+does not carry between blocks, so a block decodes without knowing where it sits
+in the stream. A candidate is considered only when its opcode and four-byte
+operand lie within the block, so the filter never reads or writes past the end
+of the block. The filter has no separate tail: the last four bytes are
+rewritten when they are the operand of a candidate whose opcode is at
+`len - 5`.
+
+The transform is the following procedure. Arithmetic on `u32` values wraps
+modulo 2^32. `buf` is the block's bytes and `len` is its length. The encoder
+direction uses `+` where the procedure says so; the decoder direction uses `-`.
+
+```text
+if len < 5: return
+prev_mask = 0
+prev_pos = 2^32 - 5
+limit = len - 5
+pos = 0
+while pos <= limit:
+    if buf[pos] is not 0xE8 and not 0xE9:
+        pos += 1
+        continue
+    offset = pos - prev_pos
+    prev_pos = pos
+    if offset > 5:
+        prev_mask = 0
+    else:
+        repeat offset times:
+            prev_mask = (prev_mask & 0x77) << 1
+    tail = buf[pos + 4]
+    if tail is 0x00 or 0xFF, and (prev_mask >> 1) <= 4, and (prev_mask >> 1) != 3:
+        src = (tail << 24) | (buf[pos + 3] << 16) | (buf[pos + 2] << 8) | buf[pos + 1]
+        loop:
+            dest = src + (pos + 5)
+            if prev_mask == 0: break
+            i = [0, 1, 2, 2, 3][prev_mask >> 1]
+            b = (dest >> (24 - 8 * i)) & 0xFF
+            if b is not 0x00 and not 0xFF: break
+            src = dest XOR ((1 << (32 - 8 * i)) - 1)
+        buf[pos + 4] = 0xFF if (dest >> 24) & 1 else 0x00
+        buf[pos + 3] = (dest >> 16) & 0xFF
+        buf[pos + 2] = (dest >> 8) & 0xFF
+        buf[pos + 1] = dest & 0xFF
+        pos += 5
+        prev_mask = 0
+    else:
+        pos += 1
+        prev_mask |= 1
+        if tail is 0x00 or 0xFF:
+            prev_mask |= 0x10
+```
+
+For the decoder direction, replace `dest = src + (pos + 5)` with
+`dest = src - (pos + 5)`.
+
+## Compressed metadata
+
+When `FLAG_COMPRESSED_METADATA` is set, every present section for which
+`SectionKind::is_compressible()` holds is stored as a compressed frame. Those
+sections are the inode table, directory entries, name table, extent table,
+attribute table, and extended attributes. The block index and the dictionaries
+section are always stored raw.
+
+A compressed section has this layout:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | `decoded_length`, the section's decoded size |
+| 8 | rest | one Zstandard frame with no dictionary, up to the digest |
+| ... | 8 | `xxh3-64` digest of the stored bytes |
+
+The section's `length` includes the digest. The digest covers the stored bytes,
+that is the eight-byte length prefix and the frame, not the decoded content. The
+prefix records the section's decoded length; the reader uses it to bound the
+decompression. For a section stored raw, the stored bytes are the section's
+content, so the digest covers the raw content.
+
+The block index stays raw because its entries record the offsets of the data
+blocks that follow it. Compressing it would make the layout depend on the
+compressed size of a section whose content depends on the layout. The
+dictionaries section stays raw because a dictionary is close to incompressible
+itself.
+
+A reader SHALL reject `FLAG_COMPRESSED_METADATA` on an image whose
+`version_minor` is below 2. A reader without zstd support cannot expand a
+compressed section and SHALL fail rather than return the stored bytes as
+content.
 
 ## Block index
 
@@ -271,13 +399,14 @@ name bytes with no separators and no terminators.
 ## Dictionaries
 
 The dictionaries section holds a single Zstandard dictionary, and its content
-is exactly that dictionary's bytes. A block whose codec is `zstd-dict` is
-decoded with it.
+is exactly that dictionary's bytes. A block whose codec is `zstd-dict` or
+`zstd-dict-bcj` is decoded with it. For `zstd-dict-bcj`, the dictionary applies
+to the BCJ-filtered bytes.
 
-An image that uses `zstd-dict` SHALL have a present dictionaries section, and
-an image that does not use `zstd-dict` SHALL have it absent. A reader SHALL
-reject an image that sets the `zstd-dict` bit in `codec_mask` without a
-dictionaries section.
+An image whose `codec_mask` sets either dictionary bit SHALL have a present
+dictionaries section, and an image whose `codec_mask` sets neither SHALL have
+it absent. A reader SHALL reject an image whose `codec_mask` sets either
+dictionary bit without a dictionaries section.
 
 One dictionary per image is deliberate. Blocks are compressed independently and
 seeded from the same dictionary, which is what lets a small block reach a ratio
@@ -288,7 +417,7 @@ close to a much larger one without enlarging the decode unit.
 | Covered | Digest location |
 |---|---|
 | Superblock bytes `[0, 4088)` | superblock offset 4088 |
-| Each metadata section | 8-byte `xxh3-64` immediately after the section's bytes, inside its `length` |
+| Each metadata section's stored bytes | 8-byte `xxh3-64` immediately after them, inside the section's `length` |
 | Each block's stored bytes | 8-byte `xxh3-64` immediately after them, outside `stored_length` |
 
 A reader SHALL verify the superblock digest before trusting any other field. It
@@ -297,7 +426,7 @@ a block's digest before returning any byte decoded from it.
 
 ## Canonical encoding
 
-A given logical image has exactly one valid encoding. A writer SHALL follow
+A given logical image has exactly one canonical encoding. A writer SHALL follow
 every rule below, and two conforming writers therefore produce byte-identical
 output from identical input.
 
@@ -309,13 +438,15 @@ output from identical input.
 4. Blocks appear in ascending stream order, and the stream is filled in the
    order content is first referenced by rule 2.
 5. A file's extents appear in ascending `file_offset`.
-6. Sections appear in the order given by the section table, each starting at
-   the next multiple of 4096.
+6. Sections appear in the order inodes, dirents, names, extents, attributes,
+   extended attributes, blocks, dictionaries (section kind indices 0, 1, 2, 3,
+   6, 7, 4, 5), each starting at the next multiple of 4096.
 7. All padding is zero.
 8. Reserved fields are zero.
 9. A block is stored with codec `stored` when no available codec produces a
-   strictly smaller result. Among codecs producing the same size, the lowest
-   codec id wins.
+   strictly smaller result. When a BCJ codec is permitted, the writer also
+   compresses the block with the BCJ filter applied and keeps the smallest
+   result. Among codecs producing the same size, the lowest codec id wins.
 10. Attribute table entries are sorted ascending by mode, then user, then
     group.
 11. Each inode array's width is the smallest that represents every value it
@@ -325,6 +456,14 @@ output from identical input.
     occupies the pool once.
 13. `mtime_base` is the smallest modification time the image records, or zero
     when it records none.
+14. The superblock sets `FLAG_COMPRESSED_METADATA`.
+15. `codec_mask` contains the `stored` bit and the bit of every codec a block
+    uses.
+
+An image with `FLAG_COMPRESSED_METADATA` clear is valid but non-canonical. The
+canonical encoding uses walk order for the stream; a writer that reorders it,
+for example with `mkstipple --order ext`, produces a valid but non-canonical
+image.
 
 Rule 9 exists because a size tie between codecs would otherwise leave the
 choice to the writer's iteration order, which is not determined by content.

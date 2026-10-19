@@ -3,9 +3,10 @@
 use crate::error::{Error, Result};
 use crate::format::{
     ALIGNMENT, ATTR_ENTRY_SIZE, BLOCK_ENTRY_SIZE, Codec, DIRENT_SIZE, Dirent, EXTENT_SIZE, Extent,
-    FileType, INODE_HEADER_SIZE, Inode, InodeWidths, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE,
-    MIN_VERSION_MINOR, SECTION_COUNT, SUPERBLOCK_SIZE, Section, SectionKind, Superblock,
-    VERSION_MAJOR, XATTR_PAIR_SIZE, supported_codecs,
+    FLAG_COMPRESSED_METADATA, FileType, INODE_HEADER_SIZE, Inode, InodeWidths, KNOWN_CODEC_BITS,
+    KNOWN_FLAG_BITS, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, MIN_VERSION_MINOR, SECTION_COUNT,
+    SUPERBLOCK_SIZE, Section, SectionKind, Superblock, VERSION_MAJOR, XATTR_PAIR_SIZE,
+    supported_codecs,
 };
 use crate::source::{ByteSource, Region};
 
@@ -130,20 +131,32 @@ pub(crate) fn parse_superblock(
     }
 
     let codec_mask = u16at(bytes, 14);
+    if codec_mask & !KNOWN_CODEC_BITS != 0 {
+        return Err(Error::Malformed {
+            detail: "codec_mask names a codec the format does not define",
+        });
+    }
     let missing = codec_mask & !supported_codecs();
     if missing != 0 {
         return Err(Error::UnsupportedCodec { missing });
     }
-    if codec_mask & !((1 << (Codec::ZstdDict.id() + 1)) - 1) != 0 {
+
+    let flags = u16at(bytes, 12);
+    if flags & !KNOWN_FLAG_BITS != 0 {
         return Err(Error::Malformed {
-            detail: "codec_mask names a codec the format does not define",
+            detail: "the superblock sets a flag the format does not define",
+        });
+    }
+    if flags & FLAG_COMPRESSED_METADATA != 0 && version_minor < 2 {
+        return Err(Error::Malformed {
+            detail: "compressed metadata is not defined before minor version 2",
         });
     }
 
     Ok(Superblock {
         version_major,
         version_minor,
-        flags: u16at(bytes, 12),
+        flags,
         codec_mask,
         image_length,
         stream_length: u64at(bytes, 24),
@@ -237,6 +250,50 @@ fn parse_inode_widths(section: &[u8], inode_count: u32) -> Result<InodeWidths> {
     Ok(widths)
 }
 
+/// Expand a metadata section stored as a decoded-length prefix and a zstd
+/// frame. The frame decompresses to exactly the recorded length, or the image
+/// is malformed.
+#[cfg(feature = "zstd")]
+fn expand_section(stored: &[u8]) -> Result<Vec<u8>> {
+    if stored.len() < 8 {
+        return Err(Error::Malformed {
+            detail: "a compressed section is too short to hold its decoded length",
+        });
+    }
+    let decoded_length = u64::from_le_bytes(stored[..8].try_into().unwrap());
+    if decoded_length > MAX_SECTION_BYTES {
+        return Err(Error::Malformed {
+            detail: "a compressed section declares an absurd decoded length",
+        });
+    }
+    let mut d = zstd::bulk::Decompressor::new()?;
+    let out = d
+        .decompress(&stored[8..], decoded_length as usize)
+        .map_err(|_| Error::Malformed {
+            detail: "a compressed section failed to decompress",
+        })?;
+    if out.len() as u64 != decoded_length {
+        return Err(Error::Malformed {
+            detail: "a compressed section decoded to a length other than the one recorded",
+        });
+    }
+    Ok(out)
+}
+
+/// Sections are built in memory by the writer, so a decoded length beyond
+/// this can only be a corrupt length prefix.
+#[cfg(feature = "zstd")]
+const MAX_SECTION_BYTES: u64 = 1 << 40;
+
+/// A build without zstd cannot expand a compressed section, so any image
+/// that stores one is refused rather than misread.
+#[cfg(not(feature = "zstd"))]
+fn expand_section(_stored: &[u8]) -> Result<Vec<u8>> {
+    Err(Error::Malformed {
+        detail: "the image stores compressed metadata but this build has no zstd support",
+    })
+}
+
 /// A metadata section's bytes, borrowed when the source allows it.
 pub type SectionData<'a> = std::borrow::Cow<'a, [u8]>;
 
@@ -286,8 +343,9 @@ impl BlockIndex<'_> {
 impl<'a> Image<'a> {
     /// Read a metadata section, verifying its digest.
     ///
-    /// The bytes are borrowed when the underlying source can lend them, so
-    /// metadata is searched in place rather than copied.
+    /// The bytes are borrowed when the underlying source can lend them and the
+    /// image stores the section raw. A section stored compressed is expanded
+    /// once here, so every caller sees the same bytes either way.
     pub fn section_data(&self, kind: SectionKind) -> Result<SectionData<'_>> {
         let section = self.superblock.section(kind);
         if section.is_absent() {
@@ -298,30 +356,43 @@ impl<'a> Image<'a> {
                 detail: "a present section is too short to hold its digest",
             });
         }
-        let content_len = section.size - 8;
+        let content_len = (section.size - 8) as usize;
 
-        let (content, stored) = match self.region.slice(section.offset, section.size) {
+        let compressed =
+            self.superblock.flags & FLAG_COMPRESSED_METADATA != 0 && kind.is_compressible();
+
+        match self.region.slice(section.offset, section.size) {
             Some(all) => {
-                let (c, d) = all.split_at(content_len as usize);
+                let (c, d) = all.split_at(content_len);
                 let mut digest_bytes = [0u8; 8];
                 digest_bytes.copy_from_slice(d);
-                (SectionData::Borrowed(c), u64::from_le_bytes(digest_bytes))
+                if digest(c) != u64::from_le_bytes(digest_bytes) {
+                    return Err(Error::ChecksumMismatch {
+                        what: "metadata section",
+                    });
+                }
+                if !compressed {
+                    return Ok(SectionData::Borrowed(c));
+                }
+                Ok(SectionData::Owned(expand_section(c)?))
             }
             None => {
-                let mut c = vec![0u8; content_len as usize];
+                let mut c = vec![0u8; content_len];
                 self.region.read_at(section.offset, &mut c)?;
                 let mut d = [0u8; 8];
-                self.region.read_at(section.offset + content_len, &mut d)?;
-                (SectionData::Owned(c), u64::from_le_bytes(d))
+                self.region
+                    .read_at(section.offset + content_len as u64, &mut d)?;
+                if digest(&c) != u64::from_le_bytes(d) {
+                    return Err(Error::ChecksumMismatch {
+                        what: "metadata section",
+                    });
+                }
+                if !compressed {
+                    return Ok(SectionData::Owned(c));
+                }
+                Ok(SectionData::Owned(expand_section(&c)?))
             }
-        };
-
-        if digest(&content) != stored {
-            return Err(Error::ChecksumMismatch {
-                what: "metadata section",
-            });
         }
-        Ok(content)
     }
 
     /// Read and validate the block index.
@@ -384,10 +455,21 @@ impl<'a> Image<'a> {
 /// budget   256 MiB : idle 3,904 kB, peak 25,212 kB
 /// ```
 ///
-/// Idle memory does not move with the budget, because it is the metadata
-/// floor. Peak memory rises with the budget and then stops once the working
-/// set fits, which is why the largest budget buys nothing over the default.
+/// Those figures were measured with raw metadata sections; compressed ones
+/// lower the idle floor. Idle memory does not move with the budget, because it
+/// is the metadata floor. Peak memory rises with the budget and then stops
+/// once the working set fits, which is why the largest budget buys nothing
+/// over the default.
 pub const DEFAULT_CACHE_BUDGET: usize = 32 << 20;
+
+/// How many decoded blocks of headroom the default budget carries.
+///
+/// A reader working through large blocks needs room for several of them at
+/// once: with a budget of two blocks, any interleaving of three files evicts
+/// continuously. Eight keeps a directory walk and a handful of concurrent
+/// readers from thrashing, and costs nothing until the working set actually
+/// fills the budget.
+pub const DEFAULT_BLOCKS_RETAINED: usize = 8;
 
 /// The decoded bytes of a block.
 ///
@@ -956,6 +1038,22 @@ impl<'i> Reader<'i> {
                             });
                         }
                         #[cfg(feature = "zstd")]
+                        Codec::ZstdBcj => {
+                            let mut d = zstd::bulk::Decompressor::new()?;
+                            let mut out = self.phase(
+                                |m| &m.decode_ns,
+                                || d.decompress(&raw, e.decoded_length as usize),
+                            )?;
+                            self.phase(|m| &m.decode_ns, || crate::bcj::decode(&mut out));
+                            out
+                        }
+                        #[cfg(not(feature = "zstd"))]
+                        Codec::ZstdBcj => {
+                            return Err(Error::UnsupportedCodec {
+                                missing: e.codec.bit(),
+                            });
+                        }
+                        #[cfg(feature = "zstd")]
                         Codec::ZstdDict => {
                             let dict = self.dictionary.as_ref().ok_or(Error::Malformed {
                                 detail: "a block uses the image dictionary but none is present",
@@ -971,6 +1069,28 @@ impl<'i> Reader<'i> {
                         }
                         #[cfg(not(feature = "zstd"))]
                         Codec::ZstdDict => {
+                            return Err(Error::UnsupportedCodec {
+                                missing: e.codec.bit(),
+                            });
+                        }
+                        #[cfg(feature = "zstd")]
+                        Codec::ZstdDictBcj => {
+                            let dict = self.dictionary.as_ref().ok_or(Error::Malformed {
+                                detail: "a block uses the image dictionary but none is present",
+                            })?;
+                            let mut d = self.phase(
+                                |m| &m.dctx_ns,
+                                || zstd::bulk::Decompressor::with_prepared_dictionary(dict),
+                            )?;
+                            let mut out = self.phase(
+                                |m| &m.decode_ns,
+                                || d.decompress(&raw, e.decoded_length as usize),
+                            )?;
+                            self.phase(|m| &m.decode_ns, || crate::bcj::decode(&mut out));
+                            out
+                        }
+                        #[cfg(not(feature = "zstd"))]
+                        Codec::ZstdDictBcj => {
                             return Err(Error::UnsupportedCodec {
                                 missing: e.codec.bit(),
                             });
@@ -1054,17 +1174,19 @@ impl<'i> Reader<'i> {
 impl<'a> Image<'a> {
     /// Build a reader with a cache budget suited to the image.
     ///
-    /// The default holds a few hundred blocks at a small block size, but an
-    /// image built with very large blocks needs room for at least a couple of
-    /// them, so the budget is raised to fit when necessary.
+    /// The default holds a few hundred blocks at a small block size. An image
+    /// built with very large blocks needs room for several of them at once, so
+    /// the budget grows with the block size, never below
+    /// [`DEFAULT_CACHE_BUDGET`].
     pub fn reader(&self) -> Result<Reader<'_>> {
         self.reader_with_budget(self.default_budget())
     }
 
     /// The budget [`Image::reader`] would use.
     pub fn default_budget(&self) -> usize {
-        let two_blocks = (self.superblock.block_size as usize).saturating_mul(2);
-        DEFAULT_CACHE_BUDGET.max(two_blocks)
+        let retained =
+            (self.superblock.block_size as usize).saturating_mul(DEFAULT_BLOCKS_RETAINED);
+        DEFAULT_CACHE_BUDGET.max(retained)
     }
 
     /// Build a reader whose decoded-block cache holds at most `budget` bytes.
@@ -1093,9 +1215,12 @@ impl<'a> Image<'a> {
             dictionary: {
                 let d = self.section_data(SectionKind::Dictionaries)?;
                 if d.is_empty() {
-                    if self.superblock.codec_mask & Codec::ZstdDict.bit() != 0 {
+                    if self.superblock.codec_mask
+                        & (Codec::ZstdDict.bit() | Codec::ZstdDictBcj.bit())
+                        != 0
+                    {
                         return Err(Error::Malformed {
-                            detail: "codec_mask names zstd-dict but no dictionary is present",
+                            detail: "codec_mask names a dictionary codec but no dictionary is present",
                         });
                     }
                     None
@@ -1306,7 +1431,46 @@ mod tests {
         let mut b = fixture();
         b[14..16].copy_from_slice(&0x8000u16.to_le_bytes());
         seal(&mut b);
-        assert!(parse_superblock(&b, 4096 * 4).is_err());
+        assert!(matches!(
+            parse_superblock(&b, 4096 * 4),
+            Err(Error::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_flag_the_format_does_not_define() {
+        let mut b = fixture();
+        b[10..12].copy_from_slice(&VERSION_MINOR.to_le_bytes());
+        b[12..14].copy_from_slice(&0x8000u16.to_le_bytes());
+        seal(&mut b);
+        assert!(matches!(
+            parse_superblock(&b, 4096 * 4),
+            Err(Error::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_compressed_metadata_before_minor_version_two() {
+        let mut b = fixture();
+        b[10..12].copy_from_slice(&1u16.to_le_bytes());
+        b[12..14].copy_from_slice(&FLAG_COMPRESSED_METADATA.to_le_bytes());
+        seal(&mut b);
+        assert!(matches!(
+            parse_superblock(&b, 4096 * 4),
+            Err(Error::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_the_compressed_metadata_flag() {
+        let mut b = fixture();
+        b[10..12].copy_from_slice(&VERSION_MINOR.to_le_bytes());
+        b[12..14].copy_from_slice(&FLAG_COMPRESSED_METADATA.to_le_bytes());
+        seal(&mut b);
+        assert_eq!(
+            parse_superblock(&b, 4096 * 4).unwrap().flags,
+            FLAG_COMPRESSED_METADATA
+        );
     }
 }
 
@@ -1329,6 +1493,56 @@ mod image_tests {
     fn rejects_a_range_too_short_for_a_superblock() {
         let image = valid_image();
         assert!(Image::new(image, 0, 100).is_err());
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn expands_a_compressed_section() {
+        let decoded: Vec<u8> = (0..10_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let image = super::tests_support::Builder::default()
+            .compressed_section(SectionKind::Names, &decoded)
+            .build();
+        let opened = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        assert_eq!(
+            opened.superblock().flags & FLAG_COMPRESSED_METADATA,
+            FLAG_COMPRESSED_METADATA
+        );
+        assert_eq!(
+            &opened.section_data(SectionKind::Names).unwrap()[..],
+            &decoded[..]
+        );
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn rejects_a_compressed_section_that_decodes_to_the_wrong_length() {
+        let decoded = vec![7u8; 5_000];
+        let frame = zstd::encode_all(&decoded[..], 3).unwrap();
+        let mut stored = Vec::new();
+        stored.extend_from_slice(&1_000u64.to_le_bytes());
+        stored.extend_from_slice(&frame);
+        let image = super::tests_support::Builder::default()
+            .section(SectionKind::Names, stored)
+            .flags(FLAG_COMPRESSED_METADATA)
+            .build();
+        let opened = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        assert!(opened.section_data(SectionKind::Names).is_err());
+    }
+
+    #[test]
+    fn a_raw_section_survives_the_flag_only_when_it_is_excluded() {
+        // Blocks and Dictionaries stay raw even when the flag is set, so a
+        // fixture storing them raw must read back unchanged.
+        let decoded = vec![3u8; 4_000];
+        let image = super::tests_support::Builder::default()
+            .section(SectionKind::Blocks, decoded.clone())
+            .flags(FLAG_COMPRESSED_METADATA)
+            .build();
+        let opened = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        assert_eq!(
+            &opened.section_data(SectionKind::Blocks).unwrap()[..],
+            &decoded[..]
+        );
     }
 
     #[cfg(feature = "fs")]
@@ -1369,6 +1583,7 @@ mod tests_support {
         pub sections: Vec<(SectionKind, Vec<u8>)>,
         pub block_count: u32,
         pub codec_mask: u16,
+        pub flags: u16,
         pub block_size: u32,
         pub data: Vec<u8>,
         pub stream_length: u64,
@@ -1382,6 +1597,7 @@ mod tests_support {
                 sections: Vec::new(),
                 block_count: 0,
                 codec_mask: Codec::Stored.bit(),
+                flags: 0,
                 block_size: 65536,
                 data: Vec::new(),
                 stream_length: 0,
@@ -1394,6 +1610,24 @@ mod tests_support {
     impl Builder {
         pub fn section(mut self, kind: SectionKind, content: Vec<u8>) -> Self {
             self.sections.push((kind, content));
+            self
+        }
+
+        /// Store `decoded` as a compressed section, the way the writer does
+        /// when the compressed-metadata flag is set.
+        #[cfg(feature = "zstd")]
+        pub fn compressed_section(mut self, kind: SectionKind, decoded: &[u8]) -> Self {
+            let frame = zstd::encode_all(decoded, 3).unwrap();
+            let mut stored = Vec::with_capacity(8 + frame.len());
+            stored.extend_from_slice(&(decoded.len() as u64).to_le_bytes());
+            stored.extend_from_slice(&frame);
+            self.flags |= FLAG_COMPRESSED_METADATA;
+            self.sections.push((kind, stored));
+            self
+        }
+
+        pub fn flags(mut self, f: u16) -> Self {
+            self.flags = f;
             self
         }
 
@@ -1445,6 +1679,7 @@ mod tests_support {
             b[0..8].copy_from_slice(&MAGIC);
             b[8..10].copy_from_slice(&VERSION_MAJOR.to_le_bytes());
             b[10..12].copy_from_slice(&VERSION_MINOR.to_le_bytes());
+            b[12..14].copy_from_slice(&self.flags.to_le_bytes());
             b[14..16].copy_from_slice(&self.codec_mask.to_le_bytes());
             b[16..24].copy_from_slice(&total.to_le_bytes());
             b[24..32].copy_from_slice(&self.stream_length.to_le_bytes());

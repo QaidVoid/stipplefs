@@ -11,9 +11,9 @@ use crate::chunk::{ChunkerConfig, chunks};
 use crate::error::{Error, Result};
 use crate::format::{
     ALIGNMENT, ATTR_ENTRY_SIZE, BLOCK_ENTRY_SIZE, Codec, DIRENT_SIZE, EXTENT_SIZE,
-    INODE_HEADER_SIZE, InodeWidths, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, S_IFBLK, S_IFCHR,
-    S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK, SECTION_COUNT, SUPERBLOCK_SIZE, SectionKind,
-    Superblock, VERSION_MAJOR, VERSION_MINOR,
+    FLAG_COMPRESSED_METADATA, INODE_HEADER_SIZE, InodeWidths, KNOWN_CODEC_BITS, MAGIC,
+    MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK,
+    SECTION_COUNT, SUPERBLOCK_SIZE, SectionKind, Superblock, VERSION_MAJOR, VERSION_MINOR,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -48,6 +48,9 @@ pub struct Options {
     pub memory_limit: Option<usize>,
     /// What to record for modification times.
     pub timestamps: Timestamps,
+    /// Store the metadata sections as compressed frames. Requires the `zstd`
+    /// feature; ignored without it.
+    pub compress_metadata: bool,
 }
 
 /// How files are ordered in the stream before chunking.
@@ -77,12 +80,17 @@ impl Default for Options {
         Options {
             block_size: 65536,
             chunk_average: 65536,
-            codecs: Codec::Stored.bit() | Codec::Zstd.bit() | Codec::ZstdDict.bit(),
+            codecs: Codec::Stored.bit()
+                | Codec::Zstd.bit()
+                | Codec::ZstdDict.bit()
+                | Codec::ZstdBcj.bit()
+                | Codec::ZstdDictBcj.bit(),
             level: 19,
             dictionary_size: 112 * 1024,
             threads: 1,
             memory_limit: None,
             timestamps: Timestamps::default(),
+            compress_metadata: true,
         }
     }
 }
@@ -265,6 +273,11 @@ impl Builder {
         if options.codecs & Codec::Stored.bit() == 0 {
             return Err(Error::Malformed {
                 detail: "the stored codec cannot be excluded",
+            });
+        }
+        if options.codecs & !KNOWN_CODEC_BITS != 0 {
+            return Err(Error::Malformed {
+                detail: "the codec set names a codec the format does not define",
             });
         }
         if !(MIN_LEVEL..=MAX_LEVEL).contains(&options.level) {
@@ -511,16 +524,22 @@ impl Builder {
         self.visit(&self.root, root, &mut plan, &[], &mut placements)?;
 
         if self.order == FileOrder::Extension {
+            // Files added as bytes carry no path, so they sort before every
+            // path and keep their relative order among themselves.
+            type Key<'a> = (
+                Option<Option<&'a std::ffi::OsStr>>,
+                Option<Option<&'a std::ffi::OsStr>>,
+            );
             placements.sort_by(|a, b| {
-                let key_a = match &a.1 {
+                let key_a: Key<'_> = match &a.1 {
                     Pending::Bytes(_) => (None, None),
                     #[cfg(feature = "fs")]
-                    Pending::Path(p) => (p.extension(), p.file_name()),
+                    Pending::Path(p) => (Some(p.extension()), Some(p.file_name())),
                 };
-                let key_b = match &b.1 {
+                let key_b: Key<'_> = match &b.1 {
                     Pending::Bytes(_) => (None, None),
                     #[cfg(feature = "fs")]
-                    Pending::Path(p) => (p.extension(), p.file_name()),
+                    Pending::Path(p) => (Some(p.extension()), Some(p.file_name())),
                 };
                 key_a.cmp(&key_b)
             });
@@ -946,11 +965,69 @@ fn write_zeros(out: &mut dyn std::io::Write, mut n: u64) -> Result<()> {
 }
 
 impl Builder {
+    /// Store one metadata section's bytes as they will sit in the image.
+    ///
+    /// With metadata compression enabled the section is a decoded-length
+    /// prefix followed by one zstd frame. Two sections stay raw: the
+    /// dictionary, which is close to incompressible itself, and the block
+    /// index, which records the offsets of the data blocks that follow it.
+    /// Compressing the index would make the layout depend on the compressed
+    /// size of a section whose content depends on the layout.
+    fn seal_section(&self, kind: SectionKind, content: Vec<u8>) -> Result<Vec<u8>> {
+        if !kind.is_compressible() || !self.compress_metadata_enabled() {
+            return Ok(content);
+        }
+        #[cfg(feature = "zstd")]
+        {
+            let frame = zstd::encode_all(&content[..], self.options.level).map_err(|_| {
+                Error::Malformed {
+                    detail: "a metadata section failed to compress",
+                }
+            })?;
+            let mut out = Vec::with_capacity(8 + frame.len());
+            out.extend_from_slice(&(content.len() as u64).to_le_bytes());
+            out.extend_from_slice(&frame);
+            Ok(out)
+        }
+        #[cfg(not(feature = "zstd"))]
+        Ok(content)
+    }
+
+    /// Whether this build stores metadata sections as compressed frames.
+    ///
+    /// Without the `zstd` feature there is nothing to compress with, so the
+    /// option is inert and the flag stays clear.
+    #[cfg(feature = "zstd")]
+    fn compress_metadata_enabled(&self) -> bool {
+        self.options.compress_metadata
+    }
+
+    #[cfg(not(feature = "zstd"))]
+    fn compress_metadata_enabled(&self) -> bool {
+        false
+    }
+
+    /// The superblock flag bits this image is written with.
+    fn superblock_flags(&self) -> u16 {
+        if self.compress_metadata_enabled() {
+            FLAG_COMPRESSED_METADATA
+        } else {
+            0
+        }
+    }
+}
+
+impl Builder {
     /// Choose how to store one block.
     ///
     /// Stored wins unless another permitted codec is strictly smaller, and
     /// among equally sized results the lowest codec identifier wins, so the
     /// choice is decided by content rather than by iteration order.
+    ///
+    /// When a BCJ codec is permitted, the block is also compressed once with
+    /// its call and jump operands rewritten to absolute targets. The filtered
+    /// bytes compress to a different, usually smaller frame; nothing else
+    /// about the block changes.
     fn encode_block(&self, raw: &[u8], dict: Option<&[u8]>) -> (Codec, Vec<u8>) {
         #[allow(unused_mut)]
         let mut best = (Codec::Stored, raw.to_vec());
@@ -969,6 +1046,30 @@ impl Builder {
             && z.len() < best.1.len()
         {
             best = (Codec::ZstdDict, z);
+        }
+        #[cfg(feature = "zstd")]
+        {
+            let bcj_plain = self.options.codecs & Codec::ZstdBcj.bit() != 0;
+            let bcj_dict = self.options.codecs & Codec::ZstdDictBcj.bit() != 0;
+            if bcj_plain || bcj_dict {
+                let mut filtered = raw.to_vec();
+                crate::bcj::encode(&mut filtered);
+                if bcj_plain
+                    && let Ok(z) = zstd::encode_all(&filtered[..], self.options.level)
+                    && z.len() < best.1.len()
+                {
+                    best = (Codec::ZstdBcj, z);
+                }
+                if bcj_dict
+                    && let Some(d) = dict
+                    && let Ok(mut c) =
+                        zstd::bulk::Compressor::with_dictionary(self.options.level, d)
+                    && let Ok(z) = c.compress(&filtered)
+                    && z.len() < best.1.len()
+                {
+                    best = (Codec::ZstdDictBcj, z);
+                }
+            }
         }
         #[cfg(not(feature = "zstd"))]
         let _ = dict;
@@ -1025,7 +1126,7 @@ impl Builder {
         #[cfg(feature = "dict")]
         {
             if self.options.dictionary_size == 0
-                || self.options.codecs & Codec::ZstdDict.bit() == 0
+                || self.options.codecs & (Codec::ZstdDict.bit() | Codec::ZstdDictBcj.bit()) == 0
                 || block_count < 8
             {
                 return Ok(None);
@@ -1100,7 +1201,7 @@ impl Builder {
             (SectionKind::ExtendedAttributes, xattrs),
         ] {
             if !content.is_empty() {
-                sections.push((kind, content));
+                sections.push((kind, self.seal_section(kind, content)?));
             }
         }
         let dict_len = dictionary.as_ref().map_or(0, |d| d.len());
@@ -1149,6 +1250,7 @@ impl Builder {
         sb[0..8].copy_from_slice(&MAGIC);
         sb[8..10].copy_from_slice(&VERSION_MAJOR.to_le_bytes());
         sb[10..12].copy_from_slice(&VERSION_MINOR.to_le_bytes());
+        sb[12..14].copy_from_slice(&self.superblock_flags().to_le_bytes());
         sb[14..16].copy_from_slice(&codec_mask.to_le_bytes());
         sb[16..24].copy_from_slice(&image_length.to_le_bytes());
         sb[24..32].copy_from_slice(&stream_len.to_le_bytes());

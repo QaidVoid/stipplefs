@@ -342,7 +342,10 @@ fn a_trained_dictionary_is_used_and_round_trips() {
         0,
         "no dictionary was requested"
     );
-    assert_ne!(a.superblock().codec_mask & Codec::ZstdDict.bit(), 0);
+    assert_ne!(
+        a.superblock().codec_mask & (Codec::ZstdDict.bit() | Codec::ZstdDictBcj.bit()),
+        0
+    );
 
     let ra = a.reader().unwrap();
     let rb = b.reader().unwrap();

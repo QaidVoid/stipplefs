@@ -23,12 +23,18 @@ struct Args {
     /// Target average deduplication chunk size, in bytes.
     #[arg(long, default_value_t = 65536)]
     chunk_size: u32,
-    /// Compression level.
+    /// Compression level, for blocks and for compressed metadata.
     #[arg(long, default_value_t = 19)]
     level: i32,
-    /// Store everything uncompressed.
+    /// Store everything uncompressed, metadata included.
     #[arg(long)]
     no_compress: bool,
+    /// Skip the x86 BCJ pre-filter, which drops both BCJ codecs.
+    #[arg(long)]
+    no_bcj: bool,
+    /// Store metadata sections uncompressed.
+    #[arg(long)]
+    no_compress_metadata: bool,
     /// Largest dictionary to train, in bytes. Zero disables training.
     #[arg(long, default_value_t = 112 * 1024)]
     dictionary_size: usize,
@@ -71,10 +77,19 @@ fn run(args: Args) -> Result<(), String> {
     if !args.source.is_dir() {
         return Err(format!("{} is not a directory", args.source.display()));
     }
+    if args.no_compress && args.no_bcj {
+        return Err("--no-compress already excludes every other codec".into());
+    }
     let codecs = if args.no_compress {
         Codec::Stored.bit()
-    } else {
+    } else if args.no_bcj {
         Codec::Stored.bit() | Codec::Zstd.bit() | Codec::ZstdDict.bit()
+    } else {
+        Codec::Stored.bit()
+            | Codec::Zstd.bit()
+            | Codec::ZstdDict.bit()
+            | Codec::ZstdBcj.bit()
+            | Codec::ZstdDictBcj.bit()
     };
     let options = Options {
         block_size: args.block_size,
@@ -92,6 +107,7 @@ fn run(args: Args) -> Result<(), String> {
             MtimePolicy::Preserve => Timestamps::Preserve,
             MtimePolicy::Zero => Timestamps::Clamp,
         },
+        compress_metadata: !args.no_compress && !args.no_compress_metadata,
     };
 
     let mut builder = Builder::new(options).map_err(|e| e.to_string())?;

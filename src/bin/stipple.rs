@@ -323,7 +323,11 @@ fn check(located: Located) -> Result<(), String> {
     println!("block devices   {block_devices}");
     let verify_elapsed = t_verify.elapsed();
     let mb_s = (checked as f64 / (1024.0 * 1024.0)) / verify_elapsed.as_secs_f64();
-    println!("verified        {checked} bytes read and checksummed in {:.3} s ({:.1} MB/s)", verify_elapsed.as_secs_f64(), mb_s);
+    println!(
+        "verified        {checked} bytes read and checksummed in {:.3} s ({:.1} MB/s)",
+        verify_elapsed.as_secs_f64(),
+        mb_s
+    );
     Ok(())
 }
 
@@ -530,7 +534,9 @@ fn bench(located: Located, reads: usize, read_size: usize, seed: u64) -> Result<
     warm_latencies.sort();
 
     let p = |l: &[std::time::Duration], pct: usize| -> f64 {
-        if l.is_empty() { return 0.0; }
+        if l.is_empty() {
+            return 0.0;
+        }
         let idx = (l.len() * pct / 100).min(l.len() - 1);
         l[idx].as_secs_f64() * 1e6 // in microseconds
     };
@@ -539,12 +545,23 @@ fn bench(located: Located, reads: usize, read_size: usize, seed: u64) -> Result<
     println!("reads          {reads} (size {read_size} B)");
     println!("bytes          {got}");
     println!("open time      {:.3} ms", open_elapsed.as_secs_f64() * 1e3);
-    println!("first read     {:.3} ms", first_read_elapsed.unwrap_or_default().as_secs_f64() * 1e3);
-    println!("cold elapsed   {:.3} s ({:.1} reads/s)", elapsed_cold.as_secs_f64(), reads as f64 / elapsed_cold.as_secs_f64());
+    println!(
+        "first read     {:.3} ms",
+        first_read_elapsed.unwrap_or_default().as_secs_f64() * 1e3
+    );
+    println!(
+        "cold elapsed   {:.3} s ({:.1} reads/s)",
+        elapsed_cold.as_secs_f64(),
+        reads as f64 / elapsed_cold.as_secs_f64()
+    );
     println!("cold p50       {:.1} us", p(&cold_latencies, 50));
     println!("cold p90       {:.1} us", p(&cold_latencies, 90));
     println!("cold p99       {:.1} us", p(&cold_latencies, 99));
-    println!("warm elapsed   {:.3} s ({:.1} reads/s)", elapsed_warm.as_secs_f64(), reads as f64 / elapsed_warm.as_secs_f64());
+    println!(
+        "warm elapsed   {:.3} s ({:.1} reads/s)",
+        elapsed_warm.as_secs_f64(),
+        reads as f64 / elapsed_warm.as_secs_f64()
+    );
     println!("warm p50       {:.1} us", p(&warm_latencies, 50));
     println!("warm p90       {:.1} us", p(&warm_latencies, 90));
     println!("warm p99       {:.1} us", p(&warm_latencies, 99));
@@ -557,7 +574,12 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let outcome = match args.command {
         Command::Check(located) => check(located),
-        Command::Bench { image, reads, read_size, seed } => bench(image, reads, read_size, seed),
+        Command::Bench {
+            image,
+            reads,
+            read_size,
+            seed,
+        } => bench(image, reads, read_size, seed),
         #[cfg(feature = "mount")]
         Command::Mount {
             image,

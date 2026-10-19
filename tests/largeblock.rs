@@ -330,6 +330,28 @@ fn streaming_does_not_evict_a_working_set() {
     );
 }
 #[test]
+fn the_default_cache_budget_grows_with_the_block_size() {
+    // A budget of two blocks was a thrashing cliff; the default must hold
+    // several blocks at every permitted block size, and never drop below the
+    // small-block default.
+    for block_size in [4096u32, 65536, 1 << 20, 16 << 20] {
+        let image = image_with_blocks(block_size, 2, block_size as usize);
+        let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+        let budget = img.default_budget();
+        let expected = stipplefs::read::DEFAULT_CACHE_BUDGET
+            .max(stipplefs::read::DEFAULT_BLOCKS_RETAINED * block_size as usize);
+        assert_eq!(
+            budget, expected,
+            "block size {block_size} got budget {budget}, wanted {expected}"
+        );
+        assert!(
+            budget >= 8 * block_size as usize,
+            "block size {block_size} got a budget of only {budget} bytes"
+        );
+    }
+}
+
+#[test]
 fn streaming_decodes_each_block_once() {
     use std::sync::atomic::Ordering::Relaxed;
     let block = 1 << 16;

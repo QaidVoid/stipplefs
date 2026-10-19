@@ -48,6 +48,7 @@ impl Reference {
         );
 
         let mut sections = Vec::new();
+        let flags = u16at(&image, 12);
         for i in 0..8 {
             let base = 56 + i * 16;
             let off = u64at(&image, base);
@@ -59,7 +60,20 @@ impl Reference {
             let body = image[off as usize..(off + size - 8) as usize].to_vec();
             let stored = u64at(&image, (off + size - 8) as usize);
             assert_eq!(digest(&body), stored, "section {i} digest");
-            sections.push(body);
+            // The block index and the dictionary are always stored raw; every
+            // other section is a decoded-length prefix and a zstd frame when
+            // the superblock says metadata is compressed.
+            let compressible = !matches!(i, 4 | 5);
+            if flags & 1 != 0 && compressible {
+                let decoded_length = u64at(&body, 0) as usize;
+                let frame = &body[8..];
+                let mut d = zstd::bulk::Decompressor::new().unwrap();
+                let expanded = d.decompress(frame, decoded_length).expect("section frame");
+                assert_eq!(expanded.len(), decoded_length, "section {i} decoded length");
+                sections.push(expanded);
+            } else {
+                sections.push(body);
+            }
         }
 
         Reference {
@@ -140,6 +154,20 @@ impl Reference {
                 let dict = self.section(5);
                 let mut d = zstd::bulk::Decompressor::with_dictionary(dict).unwrap();
                 d.decompress(raw, decoded_length).expect("zstd-dict block")
+            }
+            3 => {
+                let mut out = zstd::decode_all(raw).expect("zstd-bcj block");
+                stipplefs::bcj::decode(&mut out);
+                out
+            }
+            4 => {
+                let dict = self.section(5);
+                let mut d = zstd::bulk::Decompressor::with_dictionary(dict).unwrap();
+                let mut out = d
+                    .decompress(raw, decoded_length)
+                    .expect("zstd-dict-bcj block");
+                stipplefs::bcj::decode(&mut out);
+                out
             }
             other => panic!("unknown codec {other}"),
         };
@@ -339,6 +367,14 @@ fn every_writer_option_combination_round_trips() {
                 stipplefs::format::Codec::Stored.bit()
                     | stipplefs::format::Codec::Zstd.bit()
                     | stipplefs::format::Codec::ZstdDict.bit(),
+                stipplefs::format::Codec::Stored.bit()
+                    | stipplefs::format::Codec::Zstd.bit()
+                    | stipplefs::format::Codec::ZstdBcj.bit(),
+                stipplefs::format::Codec::Stored.bit()
+                    | stipplefs::format::Codec::Zstd.bit()
+                    | stipplefs::format::Codec::ZstdDict.bit()
+                    | stipplefs::format::Codec::ZstdBcj.bit()
+                    | stipplefs::format::Codec::ZstdDictBcj.bit(),
             ] {
                 for threads in [1usize, 4] {
                     for timestamps in [
@@ -346,37 +382,40 @@ fn every_writer_option_combination_round_trips() {
                         stipplefs::write::Timestamps::Preserve,
                     ] {
                         for memory_limit in [None, Some(1 << 20), Some(64 << 20)] {
-                            let opts = Options {
-                                block_size,
-                                chunk_average,
-                                codecs,
-                                threads,
-                                memory_limit,
-                                level: 3,
-                                dictionary_size: 65536,
-                                timestamps,
-                            };
-                            let (image, expected) = random_tree(9, opts);
-                            let reference = Reference::open(image.clone());
-                            let mut found = BTreeMap::new();
-                            walk(&reference, 0, Vec::new(), &mut found);
-                            for (path, ino) in &found {
-                                assert_eq!(
-                                    &reference.read_file(*ino),
-                                    &expected[path],
-                                    "block {block_size} chunk {chunk_average} codecs {codecs:#x} \
-                                     threads {threads} timestamps {timestamps:?} \
-                                     memory {memory_limit:?}"
-                                );
+                            for compress_metadata in [false, true] {
+                                let opts = Options {
+                                    block_size,
+                                    chunk_average,
+                                    codecs,
+                                    threads,
+                                    memory_limit,
+                                    level: 3,
+                                    dictionary_size: 65536,
+                                    timestamps,
+                                    compress_metadata,
+                                };
+                                let (image, expected) = random_tree(9, opts);
+                                let reference = Reference::open(image.clone());
+                                let mut found = BTreeMap::new();
+                                walk(&reference, 0, Vec::new(), &mut found);
+                                for (path, ino) in &found {
+                                    assert_eq!(
+                                        &reference.read_file(*ino),
+                                        &expected[path],
+                                        "block {block_size} chunk {chunk_average} codecs {codecs:#x} \
+                                         threads {threads} timestamps {timestamps:?} \
+                                         memory {memory_limit:?} metadata {compress_metadata}"
+                                    );
+                                }
+                                checked += 1;
                             }
-                            checked += 1;
                         }
                     }
                 }
             }
         }
     }
-    assert_eq!(checked, 144);
+    assert_eq!(checked, 480);
 }
 
 /// A deliberately naive writer: no deduplication, no compression, one extent

@@ -111,7 +111,7 @@ fn build_check_and_extract_reproduce_the_tree() {
     );
     let report = String::from_utf8_lossy(&checked.stdout);
     assert!(
-        report.contains("format          1."),
+        report.contains("format          1.2"),
         "report was: {report}"
     );
     assert!(report.contains("verified"), "report was: {report}");
@@ -506,6 +506,116 @@ fn the_build_help_names_the_defaults_and_what_reproducibility_costs() {
     assert!(
         help.contains("Cannot go below one block"),
         "the help does not say what the memory limit cannot do:\n{help}"
+    );
+    assert!(
+        help.contains("--no-bcj"),
+        "the help does not mention the BCJ opt-out:\n{help}"
+    );
+    assert!(
+        help.contains("--no-compress-metadata"),
+        "the help does not mention the metadata opt-out:\n{help}"
+    );
+    assert!(
+        help.contains("--order"),
+        "the help does not mention stream ordering:\n{help}"
+    );
+}
+
+#[test]
+fn the_compression_opt_outs_change_the_image() {
+    use stipplefs::format::{Codec, FLAG_COMPRESSED_METADATA};
+
+    let s = Scratch::new("optouts");
+    let src = s.path("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // x86-shaped code: calls to one absolute target, so the BCJ filter turns
+    let mut code = Vec::new();
+    for p in (0..(256 << 10)).step_by(8) {
+        let target = 0x1000i32;
+        let rel = target - (p + 5);
+        code.push(0xE8u8);
+        code.extend_from_slice(&rel.to_le_bytes());
+        code.extend_from_slice(&[0x90, 0x90, 0x90]);
+    }
+    std::fs::write(src.join("code.bin"), &code).unwrap();
+    std::fs::write(src.join("text.txt"), b"the same line. ".repeat(400)).unwrap();
+    let superblock = |path: &Path| {
+        let img = stipplefs::read::Image::open(path).unwrap();
+        *img.superblock()
+    };
+    // Total stored block bytes, which alignment padding does not hide.
+    let stored_bytes = |path: &Path| -> u64 {
+        let img = stipplefs::read::Image::open(path).unwrap();
+        let index = img.block_index().unwrap();
+        (0..index.count())
+            .map(|i| index.get(i).unwrap().stored_length as u64)
+            .sum()
+    };
+    let bcj_bits = Codec::ZstdBcj.bit() | Codec::ZstdDictBcj.bit();
+
+    let plain = s.path("plain.stipple");
+    let built = build_image(&src, &plain, &[]);
+    assert!(
+        built.status.success(),
+        "default build failed: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let sb = superblock(&plain);
+    assert_ne!(
+        sb.codec_mask & bcj_bits,
+        0,
+        "no BCJ codec was chosen (mask {:#06x}, tree {:?})",
+        sb.codec_mask,
+        collect(&src)
+            .iter()
+            .map(|(n, b)| (n.clone(), b.len()))
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(sb.flags & FLAG_COMPRESSED_METADATA, 0);
+
+    let nobcj = s.path("nobcj.stipple");
+    assert!(
+        build_image(&src, &nobcj, &["--no-bcj"]).status.success(),
+        "--no-bcj build failed"
+    );
+    let sb = superblock(&nobcj);
+    assert_eq!(
+        sb.codec_mask & bcj_bits,
+        0,
+        "--no-bcj still emitted a BCJ codec"
+    );
+    assert!(
+        stored_bytes(&plain) < stored_bytes(&nobcj),
+        "BCJ did not shrink the stored blocks: {} against {}",
+        stored_bytes(&plain),
+        stored_bytes(&nobcj)
+    );
+    let nometa = s.path("nometa.stipple");
+    assert!(
+        build_image(&src, &nometa, &["--no-compress-metadata"])
+            .status
+            .success(),
+        "--no-compress-metadata build failed"
+    );
+    assert_eq!(superblock(&nometa).flags & FLAG_COMPRESSED_METADATA, 0);
+
+    let raw = s.path("raw.stipple");
+    assert!(
+        build_image(&src, &raw, &["--no-compress"]).status.success(),
+        "--no-compress build failed"
+    );
+    let sb = superblock(&raw);
+    assert_eq!(sb.codec_mask, Codec::Stored.bit());
+    assert_eq!(sb.flags, 0, "--no-compress still compressed the metadata");
+
+    let refused = build_image(
+        &src,
+        &s.path("refused.stipple"),
+        &["--no-compress", "--no-bcj"],
+    );
+    assert!(
+        !refused.status.success(),
+        "--no-compress --no-bcj should be refused as redundant"
     );
 }
 

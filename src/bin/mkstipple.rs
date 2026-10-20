@@ -35,12 +35,15 @@ struct Args {
     /// Store metadata sections uncompressed.
     #[arg(long)]
     no_compress_metadata: bool,
-    /// Largest dictionary to train, in bytes. Zero disables training.
-    #[arg(long, default_value_t = 112 * 1024)]
-    dictionary_size: usize,
-    /// Worker threads. Output does not depend on this.
-    #[arg(long, default_value_t = 1)]
-    threads: usize,
+    /// Largest dictionary to train, in bytes. Zero disables training. Defaults
+    /// to 112 KiB for blocks up to 1 MiB and to none above that, where a
+    /// dictionary no longer makes blocks smaller and only costs time.
+    #[arg(long)]
+    dictionary_size: Option<usize>,
+    /// Worker threads, defaulting to one per available core. Output does not
+    /// depend on this.
+    #[arg(long)]
+    threads: Option<usize>,
     /// Rough ceiling on memory used to compress blocks, in bytes. Cannot go
     /// below one block. Output does not depend on this.
     #[arg(long)]
@@ -54,6 +57,9 @@ struct Args {
     #[arg(long, value_enum, default_value_t = OrderArg::Walk)]
     order: OrderArg,
 }
+
+/// Largest block size that trains a dictionary unless told otherwise.
+const DICTIONARY_BLOCK_LIMIT: u32 = 1 << 20;
 
 /// How `--order` is spelled on the command line.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -100,8 +106,16 @@ fn run(args: Args) -> Result<(), String> {
             0
         } else {
             args.dictionary_size
+                .unwrap_or(if args.block_size <= DICTIONARY_BLOCK_LIMIT {
+                    112 * 1024
+                } else {
+                    0
+                })
         },
-        threads: args.threads.max(1),
+        threads: args
+            .threads
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .max(1),
         memory_limit: args.memory,
         timestamps: match args.mtime {
             MtimePolicy::Preserve => Timestamps::Preserve,

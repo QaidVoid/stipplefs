@@ -1029,23 +1029,26 @@ impl Builder {
     /// bytes compress to a different, usually smaller frame; nothing else
     /// about the block changes.
     fn encode_block(&self, raw: &[u8], dict: Option<&[u8]>) -> (Codec, Vec<u8>) {
+        // The stored candidate is the block itself, copied only if it wins.
         #[allow(unused_mut)]
-        let mut best = (Codec::Stored, raw.to_vec());
+        let mut best: (Codec, Option<Vec<u8>>) = (Codec::Stored, None);
+        #[allow(unused)]
+        let size = |b: &(Codec, Option<Vec<u8>>)| b.1.as_ref().map_or(raw.len(), Vec::len);
         #[cfg(feature = "zstd")]
         if self.options.codecs & Codec::Zstd.bit() != 0
             && let Ok(z) = zstd::encode_all(raw, self.options.level)
-            && z.len() < best.1.len()
+            && z.len() < size(&best)
         {
-            best = (Codec::Zstd, z);
+            best = (Codec::Zstd, Some(z));
         }
         #[cfg(feature = "zstd")]
         if self.options.codecs & Codec::ZstdDict.bit() != 0
             && let Some(d) = dict
             && let Ok(mut c) = zstd::bulk::Compressor::with_dictionary(self.options.level, d)
             && let Ok(z) = c.compress(raw)
-            && z.len() < best.1.len()
+            && z.len() < size(&best)
         {
-            best = (Codec::ZstdDict, z);
+            best = (Codec::ZstdDict, Some(z));
         }
         #[cfg(feature = "zstd")]
         {
@@ -1056,24 +1059,25 @@ impl Builder {
                 crate::bcj::encode(&mut filtered);
                 if bcj_plain
                     && let Ok(z) = zstd::encode_all(&filtered[..], self.options.level)
-                    && z.len() < best.1.len()
+                    && z.len() < size(&best)
                 {
-                    best = (Codec::ZstdBcj, z);
+                    best = (Codec::ZstdBcj, Some(z));
                 }
                 if bcj_dict
                     && let Some(d) = dict
                     && let Ok(mut c) =
                         zstd::bulk::Compressor::with_dictionary(self.options.level, d)
                     && let Ok(z) = c.compress(&filtered)
-                    && z.len() < best.1.len()
+                    && z.len() < size(&best)
                 {
-                    best = (Codec::ZstdDictBcj, z);
+                    best = (Codec::ZstdDictBcj, Some(z));
                 }
             }
         }
         #[cfg(not(feature = "zstd"))]
         let _ = dict;
-        best
+        let (codec, bytes) = best;
+        (codec, bytes.unwrap_or_else(|| raw.to_vec()))
     }
 
     /// Compress every block, optionally across several threads.

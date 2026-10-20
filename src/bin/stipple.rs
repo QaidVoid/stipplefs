@@ -292,6 +292,7 @@ fn check(located: Located) -> Result<(), String> {
     println!("image length    {}", sb.image_length);
     println!("stream length   {}", sb.stream_length);
     println!("block size      {}", sb.block_size);
+    println!("hot region      {} bytes", sb.hot_length);
     println!("blocks          {}", sb.block_count);
     println!("inodes          {}", sb.inode_count);
     println!("extents         {}", sb.extent_count);

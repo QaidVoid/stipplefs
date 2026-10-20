@@ -14,8 +14,9 @@ pub const VERSION_MAJOR: u16 = 1;
 
 /// Minor format version this build writes.
 ///
-/// 2 adds the BCJ-filtered codecs and the compressed-metadata flag.
-pub const VERSION_MINOR: u16 = 2;
+/// 2 adds the BCJ-filtered codecs and the compressed-metadata flag. 3 records
+/// how much of the stream a hot list fills.
+pub const VERSION_MINOR: u16 = 3;
 
 /// Lowest minor version this build can read.
 ///
@@ -198,6 +199,9 @@ pub struct Superblock {
     pub root_inode: u32,
     /// Where each section lives.
     pub sections: [Section; SECTION_COUNT],
+    /// Bytes at the front of the stream holding the files a hot list named,
+    /// zero when the writer was given none.
+    pub hot_length: u64,
 }
 
 impl Superblock {

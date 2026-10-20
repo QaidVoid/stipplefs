@@ -153,19 +153,33 @@ pub(crate) fn parse_superblock(
         });
     }
 
+    let stream_length = u64at(bytes, 24);
+    // Reserved, and so ignored, before minor version 3.
+    let hot_length = if version_minor >= 3 {
+        u64at(bytes, 184)
+    } else {
+        0
+    };
+    if hot_length > stream_length {
+        return Err(Error::Malformed {
+            detail: "the hot region is longer than the stream",
+        });
+    }
+
     Ok(Superblock {
         version_major,
         version_minor,
         flags,
         codec_mask,
         image_length,
-        stream_length: u64at(bytes, 24),
+        stream_length,
         block_size,
         inode_count: u32at(bytes, 36),
         extent_count: u32at(bytes, 40),
         block_count: u32at(bytes, 44),
         root_inode: u32at(bytes, 48),
         sections,
+        hot_length,
     })
 }
 
@@ -1501,6 +1515,30 @@ mod tests {
             parse_superblock(&b, 4096 * 4),
             Err(Error::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn reads_the_hot_region_and_rejects_one_past_the_stream() {
+        let mut b = fixture();
+        b[184..192].copy_from_slice(&1000u64.to_le_bytes());
+        seal(&mut b);
+        assert_eq!(parse_superblock(&b, 4096 * 4).unwrap().hot_length, 1000);
+
+        b[184..192].copy_from_slice(&1235u64.to_le_bytes());
+        seal(&mut b);
+        assert!(matches!(
+            parse_superblock(&b, 4096 * 4),
+            Err(Error::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn ignores_the_hot_region_bytes_before_minor_version_three() {
+        let mut b = fixture();
+        b[10..12].copy_from_slice(&2u16.to_le_bytes());
+        b[184..192].copy_from_slice(&u64::MAX.to_le_bytes());
+        seal(&mut b);
+        assert_eq!(parse_superblock(&b, 4096 * 4).unwrap().hot_length, 0);
     }
 
     #[test]

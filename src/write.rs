@@ -542,6 +542,8 @@ struct Plan {
     xattr_index: HashMap<XattrSet, u32>,
     /// Hot list rank of each inode a hot path names.
     hot_rank: HashMap<u32, usize>,
+    /// Stream bytes the hot list's files fill, once they are placed.
+    hot_length: u64,
 }
 
 impl Plan {
@@ -558,6 +560,7 @@ impl Plan {
             xattr_sets: Vec::new(),
             xattr_index: HashMap::new(),
             hot_rank: HashMap::new(),
+            hot_length: 0,
         }
     }
 
@@ -617,7 +620,11 @@ impl Builder {
                 .sort_by_key(|(ino, _)| plan.hot_rank.get(ino).copied().unwrap_or(usize::MAX));
         }
 
-        self.place_all(&placements, &mut plan, &cfg)?;
+        let hot = placements
+            .iter()
+            .take_while(|(ino, _)| plan.hot_rank.contains_key(ino))
+            .count();
+        self.place_all(&placements, hot, &mut plan, &cfg)?;
 
         let mut counts = vec![0u32; plan.inodes.len()];
         for d in &plan.dirents {
@@ -839,10 +846,12 @@ impl Builder {
         Ok(())
     }
 
-    /// Place every file's content into the stream, in the order given.
+    /// Place every file's content into the stream, in the order given, noting
+    /// where the first `hot` of them end.
     fn place_all(
         &self,
         placements: &[(u32, Pending<'_>)],
+        hot: usize,
         plan: &mut Plan,
         cfg: &ChunkerConfig,
     ) -> Result<()> {
@@ -860,6 +869,9 @@ impl Builder {
             rec.payload = payload;
             rec.extent_count = extent_count;
             bytes += content.len() as u64;
+            if done + 1 == hot {
+                plan.hot_length = plan.stream.len;
+            }
             self.report(Progress::Placing {
                 files: done as u64 + 1,
                 total_files,
@@ -1353,6 +1365,7 @@ impl Builder {
         sb[40..44].copy_from_slice(&(plan.extents.len() as u32).to_le_bytes());
         sb[44..48].copy_from_slice(&(blocks.len() as u32).to_le_bytes());
         sb[48..52].copy_from_slice(&0u32.to_le_bytes());
+        sb[184..192].copy_from_slice(&plan.hot_length.to_le_bytes());
         for (i, (off, size)) in placed.iter().enumerate() {
             let base = 56 + i * 16;
             sb[base..base + 8].copy_from_slice(&off.to_le_bytes());

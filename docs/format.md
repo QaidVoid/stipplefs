@@ -1,4 +1,4 @@
-# The stipplefs image format, version 1.2
+# The stipplefs image format, version 1.3
 
 This document defines the on-disk format completely enough to write an
 independent reader. It is normative: where it says SHALL, a conforming reader
@@ -41,7 +41,7 @@ Occupies exactly 4096 bytes at image offset 0.
 |---|---|---|---|
 | 0 | 8 | `magic` | ASCII `STIPPLE\0`, bytes `53 54 49 50 50 4C 45 00` |
 | 8 | 2 | `version_major` | `1` for this document |
-| 10 | 2 | `version_minor` | `2` for this document |
+| 10 | 2 | `version_minor` | `3` for this document |
 | 12 | 2 | `flags` | superblock flags, see below |
 | 14 | 2 | `codec_mask` | bitmask of the block codecs used in the image |
 | 16 | 8 | `image_length` | total size of the image in bytes |
@@ -53,7 +53,8 @@ Occupies exactly 4096 bytes at image offset 0.
 | 48 | 4 | `root_inode` | inode number of the root directory |
 | 52 | 4 | reserved | zero |
 | 56 | 128 | `sections` | eight `(offset, length)` pairs, see below |
-| 184 | 3904 | reserved | zero |
+| 184 | 8 | `hot_length` | bytes at the front of the stream a hot list fills, see below |
+| 192 | 3896 | reserved | zero |
 | 4088 | 8 | `checksum` | `xxh3-64` over bytes `[0, 4088)` |
 
 ### Superblock flags
@@ -102,9 +103,20 @@ A reader SHALL reject the image unless all of the following hold:
    reader implements.
 9. No bit is set in `flags` outside the flags this document defines.
 10. `FLAG_COMPRESSED_METADATA` is clear when `version_minor` is below 2.
+11. `hot_length` does not exceed `stream_length`.
 
 Rule 8 is what makes an unsupported codec fail at open rather than at the first
 affected read.
+
+### Hot region
+
+A writer may be told which files an application reads while it starts, and
+place them at the front of the stream in the order they are read. `hot_length`
+records how many stream bytes those files fill, so a reader can begin decoding
+that region before anything asks for it. It is zero when the writer was told of
+no such files. The field is defined from minor version 3; in an earlier image
+its bytes are reserved and a reader takes it as zero. It is a hint and changes
+nothing a read returns.
 
 ## Codecs
 
@@ -459,6 +471,7 @@ output from identical input.
 14. The superblock sets `FLAG_COMPRESSED_METADATA`.
 15. `codec_mask` contains the `stored` bit and the bit of every codec a block
     uses.
+16. `hot_length` is zero.
 
 An image with `FLAG_COMPRESSED_METADATA` clear is valid but non-canonical. The
 canonical encoding uses walk order for the stream; a writer that reorders it,

@@ -379,6 +379,15 @@ fn dictionary_training_is_reproducible() {
 }
 
 #[test]
+fn an_image_built_without_a_hot_list_records_no_hot_region() {
+    let mut b = Builder::new(Options::default()).unwrap();
+    b.insert(b"a", file(&pattern(9_000, 1))).unwrap();
+    let bytes = b.build().unwrap();
+    let image = Image::new(bytes.clone(), 0, bytes.len() as u64).unwrap();
+    assert_eq!(image.superblock().hot_length, 0);
+}
+
+#[test]
 fn a_hot_list_places_its_files_first_in_the_order_given() {
     let mut b = Builder::new(Options::default()).unwrap();
     let (a, c, d) = (pattern(9_000, 1), pattern(7_000, 2), pattern(5_000, 3));
@@ -399,6 +408,11 @@ fn a_hot_list_places_its_files_first_in_the_order_given() {
     };
     assert!(at(b"d") < at(b"b/c"), "the first hot file leads");
     assert!(at(b"b/c") < at(b"a"), "files off the list follow");
+    assert_eq!(
+        r.superblock().hot_length,
+        (d.len() + c.len()) as u64,
+        "the hot region ends where the last hot file does"
+    );
     for (path, want) in [(&b"a"[..], &a), (b"b/c", &c), (b"d", &d)] {
         assert_eq!(&r.read_all(r.resolve(path).unwrap()).unwrap(), want);
     }

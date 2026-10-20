@@ -33,6 +33,17 @@ enum Command {
         /// Event loop threads serving the mount.
         #[arg(long, default_value_t = 4)]
         threads: usize,
+        /// Background threads decoding blocks and storing their file bytes
+        /// in the kernel's page cache. Zero serves every read on demand.
+        #[arg(long, default_value_t = 0)]
+        warm_workers: usize,
+        /// Blocks past each read to warm ahead of it.
+        #[arg(long, default_value_t = 2)]
+        warm_ahead: u32,
+        /// Blocks at the front of the stream to warm as soon as the mount
+        /// exists.
+        #[arg(long, default_value_t = 0)]
+        warm_start: u32,
     },
     /// Time random reads served directly by the library, without FUSE.
     Bench {
@@ -429,7 +440,20 @@ fn mount(
     mountpoint: PathBuf,
     allow_other: bool,
     threads: usize,
+    warm_workers: usize,
+    warm_ahead: u32,
+    warm_start: u32,
 ) -> Result<(), String> {
+    // glibc raises its mmap threshold each time a large allocation is freed,
+    // after which decoded blocks come from per-thread heaps that keep their
+    // memory once the block is dropped. A fixed threshold keeps every block
+    // in its own mapping, returned to the system as soon as it is freed.
+    #[cfg(target_env = "gnu")]
+    // SAFETY: mallopt only adjusts allocator tuning and is called before any
+    // worker thread exists.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+    }
     use fuser::{Config, MountOption, SessionACL};
 
     let image = located.open()?;
@@ -437,6 +461,14 @@ fn mount(
         .cache_budget
         .unwrap_or_else(|| image.default_budget());
     let fs = stipplefs::mount::Mount::new(image, budget).map_err(|e| e.to_string())?;
+    let (fs, notifier) = if warm_workers > 0 {
+        let mountpoint = std::fs::canonicalize(&mountpoint)
+            .map_err(|e| format!("{}: {e}", mountpoint.display()))?;
+        let (fs, cell) = fs.with_warming(&mountpoint, warm_workers, warm_ahead, warm_start);
+        (fs, Some(cell))
+    } else {
+        (fs, None)
+    };
 
     let mut config = Config::default();
     config.mount_options = vec![
@@ -452,8 +484,18 @@ fn mount(
     };
     config.n_threads = Some(threads.max(1));
     config.clone_fd = threads > 1;
+    let reader = fs.reader();
     eprintln!("mounted on {}, interrupt to unmount", mountpoint.display());
-    fuser::mount(fs, &mountpoint, &config).map_err(|e| format!("mounting: {e}"))
+    let session =
+        fuser::Session::new(fs, &mountpoint, &config).map_err(|e| format!("mounting: {e}"))?;
+    if let Some(cell) = notifier {
+        let _ = cell.set(session.notifier());
+    }
+    session.run().map_err(|e| format!("mounting: {e}"))?;
+    if cfg!(feature = "metrics") {
+        eprint!("{}", reader.metrics().report());
+    }
+    Ok(())
 }
 
 fn bench(located: Located, reads: usize, read_size: usize, seed: u64) -> Result<(), String> {
@@ -586,7 +628,18 @@ fn main() -> ExitCode {
             mountpoint,
             allow_other,
             threads,
-        } => mount(image, mountpoint, allow_other, threads),
+            warm_workers,
+            warm_ahead,
+            warm_start,
+        } => mount(
+            image,
+            mountpoint,
+            allow_other,
+            threads,
+            warm_workers,
+            warm_ahead,
+            warm_start,
+        ),
         Command::Extract {
             image,
             destination,

@@ -52,12 +52,17 @@ fn make_source(root: &Path) {
 }
 
 fn mount_image(image: &Path, point: &Path) -> Option<Mounted> {
+    mount_image_with(image, point, &[])
+}
+
+fn mount_image_with(image: &Path, point: &Path, extra: &[&str]) -> Option<Mounted> {
     std::fs::create_dir_all(point).unwrap();
     let child = Command::new(ST)
         .arg("mount")
         .arg(image)
         .arg(point)
         .args(["--threads", "4"])
+        .args(extra)
         .spawn()
         .ok()?;
     let mut m = Mounted {
@@ -450,4 +455,93 @@ fn have(tool: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Bytes that do not repeat, so every chunk is stored once.
+fn noise(n: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed | 1;
+    (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 24) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn warming_stores_exactly_the_bytes_each_file_holds() {
+    if !fuse_available() {
+        eprintln!("skipping warming: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let dir = scratch("warm");
+    let src = dir.join("src");
+    std::fs::create_dir_all(src.join("lib")).unwrap();
+    // Odd sizes put piece boundaries in the middle of pages, and the last
+    // file repeats the first one's bytes so it is made of several extents.
+    let first = noise(70_001, 1);
+    std::fs::write(src.join("lib/a.so"), &first).unwrap();
+    std::fs::write(src.join("lib/b.so"), noise(12_345, 2)).unwrap();
+    std::fs::write(src.join("small"), noise(100, 3)).unwrap();
+    let mut mixed = noise(5_000, 4);
+    mixed.extend_from_slice(&first);
+    mixed.extend_from_slice(&noise(3_333, 5));
+    std::fs::write(src.join("mixed"), &mixed).unwrap();
+    std::fs::write(src.join("hello.txt"), b"mount is up").unwrap();
+
+    let image = dir.join("image.stipple");
+    let built = Command::new(MK)
+        .arg(&src)
+        .arg(&image)
+        .args([
+            "--block-size",
+            "8192",
+            "--chunk-size",
+            "4096",
+            "--level",
+            "3",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let point = dir.join("mnt");
+    let args = [
+        "--cache-budget",
+        "16384",
+        "--warm-workers",
+        "2",
+        "--warm-start",
+        "1000",
+    ];
+    let Some(_m) = mount_image_with(&image, &point, &args) else {
+        eprintln!("skipping: could not mount");
+        return;
+    };
+    // Let warming store every block before anything is read.
+    std::thread::sleep(Duration::from_millis(500));
+
+    for name in ["lib/a.so", "lib/b.so", "small", "mixed", "hello.txt"] {
+        for _ in 0..2 {
+            assert_eq!(
+                std::fs::read(point.join(name)).unwrap(),
+                std::fs::read(src.join(name)).unwrap(),
+                "{name} read back wrong"
+            );
+        }
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            std::fs::metadata(point.join("lib/missing"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
 }

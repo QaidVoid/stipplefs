@@ -997,112 +997,12 @@ impl<'i> Reader<'i> {
             }
         }
 
-        let region = self.region;
         let before = self.cache.decodes();
         let bytes = self.phase(
             |m| &m.fetch_ns,
             || {
-                self.cache.get_or_decode(index, streaming, move || {
-                    // The digest sits immediately after the block, so one call fetches
-                    // both. Reading it separately doubled the calls into the source.
-                    let mut raw = vec![0u8; e.stored_length as usize + 8];
-                    self.note(|m| &m.source_calls);
-                    self.note_n(|m| &m.source_bytes, raw.len() as u64);
-                    self.phase(
-                        |m| &m.source_ns,
-                        || region.read_at(e.image_offset, &mut raw),
-                    )?;
-                    let mut want = [0u8; 8];
-                    want.copy_from_slice(&raw[e.stored_length as usize..]);
-                    raw.truncate(e.stored_length as usize);
-                    if self.phase(|m| &m.digest_ns, || digest(&raw)) != u64::from_le_bytes(want) {
-                        return Err(Error::ChecksumMismatch { what: "block" });
-                    }
-                    let decoded = match e.codec {
-                        Codec::Stored => raw,
-                        #[cfg(feature = "zstd")]
-                        Codec::Zstd => {
-                            // The decoded size is recorded, so decompress into one
-                            // exactly sized allocation. `decode_all` does not know the
-                            // size and grows its buffer as it goes.
-                            let mut d = zstd::bulk::Decompressor::new()?;
-                            self.phase(
-                                |m| &m.decode_ns,
-                                || d.decompress(&raw, e.decoded_length as usize),
-                            )?
-                        }
-                        #[cfg(not(feature = "zstd"))]
-                        Codec::Zstd => {
-                            return Err(Error::UnsupportedCodec {
-                                missing: e.codec.bit(),
-                            });
-                        }
-                        #[cfg(feature = "zstd")]
-                        Codec::ZstdBcj => {
-                            let mut d = zstd::bulk::Decompressor::new()?;
-                            let mut out = self.phase(
-                                |m| &m.decode_ns,
-                                || d.decompress(&raw, e.decoded_length as usize),
-                            )?;
-                            self.phase(|m| &m.decode_ns, || crate::bcj::decode(&mut out));
-                            out
-                        }
-                        #[cfg(not(feature = "zstd"))]
-                        Codec::ZstdBcj => {
-                            return Err(Error::UnsupportedCodec {
-                                missing: e.codec.bit(),
-                            });
-                        }
-                        #[cfg(feature = "zstd")]
-                        Codec::ZstdDict => {
-                            let dict = self.dictionary.as_ref().ok_or(Error::Malformed {
-                                detail: "a block uses the image dictionary but none is present",
-                            })?;
-                            let mut d = self.phase(
-                                |m| &m.dctx_ns,
-                                || zstd::bulk::Decompressor::with_prepared_dictionary(dict),
-                            )?;
-                            self.phase(
-                                |m| &m.decode_ns,
-                                || d.decompress(&raw, e.decoded_length as usize),
-                            )?
-                        }
-                        #[cfg(not(feature = "zstd"))]
-                        Codec::ZstdDict => {
-                            return Err(Error::UnsupportedCodec {
-                                missing: e.codec.bit(),
-                            });
-                        }
-                        #[cfg(feature = "zstd")]
-                        Codec::ZstdDictBcj => {
-                            let dict = self.dictionary.as_ref().ok_or(Error::Malformed {
-                                detail: "a block uses the image dictionary but none is present",
-                            })?;
-                            let mut d = self.phase(
-                                |m| &m.dctx_ns,
-                                || zstd::bulk::Decompressor::with_prepared_dictionary(dict),
-                            )?;
-                            let mut out = self.phase(
-                                |m| &m.decode_ns,
-                                || d.decompress(&raw, e.decoded_length as usize),
-                            )?;
-                            self.phase(|m| &m.decode_ns, || crate::bcj::decode(&mut out));
-                            out
-                        }
-                        #[cfg(not(feature = "zstd"))]
-                        Codec::ZstdDictBcj => {
-                            return Err(Error::UnsupportedCodec {
-                                missing: e.codec.bit(),
-                            });
-                        }
-                    };
-                    if decoded.len() as u32 != e.decoded_length {
-                        return Err(Error::Malformed {
-                            detail: "a block decoded to a length other than the one recorded",
-                        });
-                    }
-                    Ok(decoded)
-                })
+                self.cache
+                    .get_or_decode(index, streaming, || self.decode(e))
             },
         )?;
         if self.cache.decodes() == before {
@@ -1111,6 +1011,148 @@ impl<'i> Reader<'i> {
             self.note(|m| &m.cache_misses);
         }
         Ok(Block::Cached(bytes))
+    }
+
+    /// The stream ranges holding a regular file's bytes, as
+    /// `(stream_offset, file_offset, length)` in ascending file order.
+    ///
+    /// Empty for anything that is not a regular file with content.
+    pub fn file_extents(&self, ino: u32) -> Vec<(u64, u64, u64)> {
+        let Some(node) = self.inode(ino) else {
+            return Vec::new();
+        };
+        if node.file_type() != Some(FileType::Regular) {
+            return Vec::new();
+        }
+        match node.extent_count {
+            0 => Vec::new(),
+            1 => vec![(node.payload, 0, node.size)],
+            n => (0..n)
+                .filter_map(|k| self.extent(node.payload as u32 + k))
+                .map(|e| (e.stream_offset, e.file_offset, e.length as u64))
+                .collect(),
+        }
+    }
+
+    /// The decoded bytes of block `index`, decoding it only when the cache
+    /// does not already hold it.
+    pub fn block_bytes(&self, index: u32) -> Result<Block<'_>> {
+        self.block(index, false)
+    }
+
+    /// The block holding byte `offset` of regular file `ino`, or `None` when
+    /// the file has no byte there.
+    pub fn block_of(&self, ino: u32, offset: u64) -> Option<u32> {
+        let inode = self.inode(ino)?;
+        if inode.file_type() != Some(FileType::Regular) || offset >= inode.size {
+            return None;
+        }
+        let (stream_offset, _) = self.locate(&inode, offset).ok()?;
+        u32::try_from(stream_offset / self.superblock.block_size as u64).ok()
+    }
+
+    /// Fetch, verify and decode one block's stored bytes.
+    fn decode(&self, e: BlockEntry) -> Result<Vec<u8>> {
+        let region = self.region;
+        // The digest sits immediately after the block, so one call fetches
+        // both. Reading it separately doubled the calls into the source.
+        let mut raw = vec![0u8; e.stored_length as usize + 8];
+        self.note(|m| &m.source_calls);
+        self.note_n(|m| &m.source_bytes, raw.len() as u64);
+        self.phase(
+            |m| &m.source_ns,
+            || region.read_at(e.image_offset, &mut raw),
+        )?;
+        let mut want = [0u8; 8];
+        want.copy_from_slice(&raw[e.stored_length as usize..]);
+        raw.truncate(e.stored_length as usize);
+        if self.phase(|m| &m.digest_ns, || digest(&raw)) != u64::from_le_bytes(want) {
+            return Err(Error::ChecksumMismatch { what: "block" });
+        }
+        let decoded = match e.codec {
+            Codec::Stored => raw,
+            #[cfg(feature = "zstd")]
+            Codec::Zstd => {
+                // The decoded size is recorded, so decompress into one
+                // exactly sized allocation. `decode_all` does not know the
+                // size and grows its buffer as it goes.
+                let mut d = zstd::bulk::Decompressor::new()?;
+                self.phase(
+                    |m| &m.decode_ns,
+                    || d.decompress(&raw, e.decoded_length as usize),
+                )?
+            }
+            #[cfg(not(feature = "zstd"))]
+            Codec::Zstd => {
+                return Err(Error::UnsupportedCodec {
+                    missing: e.codec.bit(),
+                });
+            }
+            #[cfg(feature = "zstd")]
+            Codec::ZstdBcj => {
+                let mut d = zstd::bulk::Decompressor::new()?;
+                let mut out = self.phase(
+                    |m| &m.decode_ns,
+                    || d.decompress(&raw, e.decoded_length as usize),
+                )?;
+                self.phase(|m| &m.decode_ns, || crate::bcj::decode(&mut out));
+                out
+            }
+            #[cfg(not(feature = "zstd"))]
+            Codec::ZstdBcj => {
+                return Err(Error::UnsupportedCodec {
+                    missing: e.codec.bit(),
+                });
+            }
+            #[cfg(feature = "zstd")]
+            Codec::ZstdDict => {
+                let dict = self.dictionary.as_ref().ok_or(Error::Malformed {
+                    detail: "a block uses the image dictionary but none is present",
+                })?;
+                let mut d = self.phase(
+                    |m| &m.dctx_ns,
+                    || zstd::bulk::Decompressor::with_prepared_dictionary(dict),
+                )?;
+                self.phase(
+                    |m| &m.decode_ns,
+                    || d.decompress(&raw, e.decoded_length as usize),
+                )?
+            }
+            #[cfg(not(feature = "zstd"))]
+            Codec::ZstdDict => {
+                return Err(Error::UnsupportedCodec {
+                    missing: e.codec.bit(),
+                });
+            }
+            #[cfg(feature = "zstd")]
+            Codec::ZstdDictBcj => {
+                let dict = self.dictionary.as_ref().ok_or(Error::Malformed {
+                    detail: "a block uses the image dictionary but none is present",
+                })?;
+                let mut d = self.phase(
+                    |m| &m.dctx_ns,
+                    || zstd::bulk::Decompressor::with_prepared_dictionary(dict),
+                )?;
+                let mut out = self.phase(
+                    |m| &m.decode_ns,
+                    || d.decompress(&raw, e.decoded_length as usize),
+                )?;
+                self.phase(|m| &m.decode_ns, || crate::bcj::decode(&mut out));
+                out
+            }
+            #[cfg(not(feature = "zstd"))]
+            Codec::ZstdDictBcj => {
+                return Err(Error::UnsupportedCodec {
+                    missing: e.codec.bit(),
+                });
+            }
+        };
+        if decoded.len() as u32 != e.decoded_length {
+            return Err(Error::Malformed {
+                detail: "a block decoded to a length other than the one recorded",
+            });
+        }
+        Ok(decoded)
     }
 
     /// Read from a regular file into `buf`, returning how many bytes were read.

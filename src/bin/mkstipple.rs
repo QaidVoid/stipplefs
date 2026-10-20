@@ -56,6 +56,11 @@ struct Args {
     /// How to order files before placing them into the stream.
     #[arg(long, value_enum, default_value_t = OrderArg::Walk)]
     order: OrderArg,
+    /// File naming, one path per line relative to the source, the files to
+    /// place first in the stream, in that order. Typically the files an
+    /// application opens while starting, in the order it opens them.
+    #[arg(long)]
+    hot_list: Option<PathBuf>,
 }
 
 /// Largest block size that trains a dictionary unless told otherwise.
@@ -138,6 +143,10 @@ fn run(args: Args) -> Result<(), String> {
         OrderArg::Walk => stipplefs::write::FileOrder::Walk,
         OrderArg::Ext => stipplefs::write::FileOrder::Extension,
     });
+    if let Some(list) = &args.hot_list {
+        let text = std::fs::read(list).map_err(|e| format!("reading {}: {e}", list.display()))?;
+        builder.set_hot_list(text.split(|&b| b == b'\n').filter(|l| !l.is_empty()));
+    }
     builder
         .add_tree(&args.source)
         .map_err(|e| format!("reading {}: {e}", args.source.display()))?;

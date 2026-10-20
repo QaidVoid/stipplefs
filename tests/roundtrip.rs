@@ -377,3 +377,29 @@ fn dictionary_training_is_reproducible() {
     };
     assert_eq!(build(), build());
 }
+
+#[test]
+fn a_hot_list_places_its_files_first_in_the_order_given() {
+    let mut b = Builder::new(Options::default()).unwrap();
+    let (a, c, d) = (pattern(9_000, 1), pattern(7_000, 2), pattern(5_000, 3));
+    b.insert(b"a", file(&a)).unwrap();
+    b.insert(b"b/c", file(&c)).unwrap();
+    b.insert(b"d", file(&d)).unwrap();
+    // Messy spellings, a name that does not exist and a repeat are all
+    // tolerated; the first mention of a name decides its place.
+    b.set_hot_list(["d", "./b//c", "missing", "d"]);
+    let bytes = b.build().unwrap();
+
+    let image = Image::new(bytes.clone(), 0, bytes.len() as u64).unwrap();
+    let r = image.reader().unwrap();
+    let at = |path: &[u8]| {
+        let node = r.inode(r.resolve(path).unwrap()).unwrap();
+        assert_eq!(node.extent_count, 1);
+        node.payload
+    };
+    assert!(at(b"d") < at(b"b/c"), "the first hot file leads");
+    assert!(at(b"b/c") < at(b"a"), "files off the list follow");
+    for (path, want) in [(&b"a"[..], &a), (b"b/c", &c), (b"d", &d)] {
+        assert_eq!(&r.read_all(r.resolve(path).unwrap()).unwrap(), want);
+    }
+}

@@ -291,6 +291,8 @@ pub struct Builder {
     /// Modification times, keyed the same way. Every kind has one, so keeping
     /// them beside the tree avoids repeating a field on every node kind.
     mtimes: BTreeMap<Vec<u8>, u64>,
+    /// Rank of each path named by [`Builder::set_hot_list`].
+    hot: HashMap<Vec<u8>, usize>,
 }
 
 impl Builder {
@@ -328,6 +330,7 @@ impl Builder {
             },
             xattrs: BTreeMap::new(),
             mtimes: BTreeMap::new(),
+            hot: HashMap::new(),
         })
     }
 
@@ -347,6 +350,27 @@ impl Builder {
     fn report(&self, p: Progress) {
         if let Some(f) = &self.progress {
             f(p);
+        }
+    }
+
+    /// Place the named files first in the stream, in the order given.
+    ///
+    /// Meant for the files an application reads while starting, so they sit
+    /// together in as few blocks as possible and in the order they are
+    /// wanted. Paths are relative to the root; names that are not regular
+    /// files in the tree are ignored, as is any repeat of an earlier name.
+    /// Every other file follows in the order [`Builder::set_order`] chose.
+    pub fn set_hot_list<P: AsRef<[u8]>>(&mut self, paths: impl IntoIterator<Item = P>) {
+        self.hot.clear();
+        for path in paths {
+            let key: Vec<u8> = path
+                .as_ref()
+                .split(|&b| b == b'/')
+                .filter(|part| !part.is_empty() && *part != b".")
+                .collect::<Vec<_>>()
+                .join(&b'/');
+            let rank = self.hot.len();
+            self.hot.entry(key).or_insert(rank);
         }
     }
 
@@ -516,6 +540,8 @@ struct Plan {
     /// Distinct attribute sets, in order of first reference.
     xattr_sets: Vec<XattrSet>,
     xattr_index: HashMap<XattrSet, u32>,
+    /// Hot list rank of each inode a hot path names.
+    hot_rank: HashMap<u32, usize>,
 }
 
 impl Plan {
@@ -531,6 +557,7 @@ impl Plan {
             links: HashMap::new(),
             xattr_sets: Vec::new(),
             xattr_index: HashMap::new(),
+            hot_rank: HashMap::new(),
         }
     }
 
@@ -593,6 +620,11 @@ impl Builder {
             });
         }
 
+        if !plan.hot_rank.is_empty() {
+            placements
+                .sort_by_key(|(ino, _)| plan.hot_rank.get(ino).copied().unwrap_or(usize::MAX));
+        }
+
         self.place_all(&placements, &mut plan, &cfg)?;
 
         let mut counts = vec![0u32; plan.inodes.len()];
@@ -653,6 +685,16 @@ impl Builder {
                 name_length,
             };
 
+            let mut key = prefix.to_vec();
+            if !key.is_empty() {
+                key.push(b'/');
+            }
+            key.extend_from_slice(name);
+            if let Some(&rank) = self.hot.get(&key) {
+                let best = plan.hot_rank.entry(child).or_insert(rank);
+                *best = (*best).min(rank);
+            }
+
             match entry {
                 Tree::Dir(d) => {
                     let mut nested = prefix.to_vec();
@@ -686,11 +728,6 @@ impl Builder {
                 }
             }
 
-            let mut key = prefix.to_vec();
-            if !key.is_empty() {
-                key.push(b'/');
-            }
-            key.extend_from_slice(name);
             if self.options.timestamps == Timestamps::Preserve
                 && let Some(t) = self.mtimes.get(&key)
             {

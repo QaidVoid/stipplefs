@@ -498,6 +498,33 @@ fn mount(
     Ok(())
 }
 
+/// Perform `picks` in order, returning the total time, each read's latency
+/// and the bytes read.
+fn time_reads(
+    reader: &Reader<'_>,
+    picks: &[(u32, u64)],
+    buf: &mut [u8],
+) -> Result<(std::time::Duration, Vec<std::time::Duration>, u64), String> {
+    let mut latencies = Vec::with_capacity(picks.len());
+    let mut got = 0u64;
+    let start = std::time::Instant::now();
+    for &(ino, offset) in picks {
+        let t = std::time::Instant::now();
+        got += reader.read(ino, offset, buf).map_err(|e| e.to_string())? as u64;
+        latencies.push(t.elapsed());
+    }
+    Ok((start.elapsed(), latencies, got))
+}
+
+/// The latency below which `pct` percent of sorted `latencies` fall, in
+/// microseconds.
+fn percentile(latencies: &[std::time::Duration], pct: usize) -> f64 {
+    let Some(last) = latencies.len().checked_sub(1) else {
+        return 0.0;
+    };
+    latencies[(latencies.len() * pct / 100).min(last)].as_secs_f64() * 1e6
+}
+
 fn bench(located: Located, reads: usize, read_size: usize, seed: u64) -> Result<(), String> {
     let t_open = std::time::Instant::now();
     let image = located.open()?;
@@ -538,75 +565,30 @@ fn bench(located: Located, reads: usize, read_size: usize, seed: u64) -> Result<
         .collect();
 
     let mut buf = vec![0u8; read_size];
-
-    // Measure cold reads
-    let mut cold_latencies = Vec::with_capacity(reads);
-    let mut got = 0u64;
-    let t_first = std::time::Instant::now();
-    let mut first_read_elapsed = None;
-
-    let start_cold = std::time::Instant::now();
-    for (i, (ino, offset)) in picks.iter().enumerate() {
-        let t0 = std::time::Instant::now();
-        let n = reader
-            .read(*ino, *offset, &mut buf)
-            .map_err(|e| e.to_string())?;
-        let lat = t0.elapsed();
-        if i == 0 {
-            first_read_elapsed = Some(t_first.elapsed());
-        }
-        got += n as u64;
-        cold_latencies.push(lat);
-    }
-    let elapsed_cold = start_cold.elapsed();
-
-    // Measure warm reads (run same picks again on warm cache)
-    let mut warm_latencies = Vec::with_capacity(reads);
-    let start_warm = std::time::Instant::now();
-    for (ino, offset) in &picks {
-        let t0 = std::time::Instant::now();
-        let _ = reader
-            .read(*ino, *offset, &mut buf)
-            .map_err(|e| e.to_string())?;
-        warm_latencies.push(t0.elapsed());
-    }
-    let elapsed_warm = start_warm.elapsed();
-
-    cold_latencies.sort();
-    warm_latencies.sort();
-
-    let p = |l: &[std::time::Duration], pct: usize| -> f64 {
-        if l.is_empty() {
-            return 0.0;
-        }
-        let idx = (l.len() * pct / 100).min(l.len() - 1);
-        l[idx].as_secs_f64() * 1e6 // in microseconds
-    };
+    // The same reads twice: first against an empty cache, then a full one.
+    let (cold_elapsed, mut cold, got) = time_reads(&reader, &picks, &mut buf)?;
+    let first_read = cold.first().copied().unwrap_or_default();
+    let (warm_elapsed, mut warm, _) = time_reads(&reader, &picks, &mut buf)?;
+    cold.sort();
+    warm.sort();
 
     println!("files eligible {}", files.len());
     println!("reads          {reads} (size {read_size} B)");
     println!("bytes          {got}");
     println!("open time      {:.3} ms", open_elapsed.as_secs_f64() * 1e3);
-    println!(
-        "first read     {:.3} ms",
-        first_read_elapsed.unwrap_or_default().as_secs_f64() * 1e3
-    );
-    println!(
-        "cold elapsed   {:.3} s ({:.1} reads/s)",
-        elapsed_cold.as_secs_f64(),
-        reads as f64 / elapsed_cold.as_secs_f64()
-    );
-    println!("cold p50       {:.1} us", p(&cold_latencies, 50));
-    println!("cold p90       {:.1} us", p(&cold_latencies, 90));
-    println!("cold p99       {:.1} us", p(&cold_latencies, 99));
-    println!(
-        "warm elapsed   {:.3} s ({:.1} reads/s)",
-        elapsed_warm.as_secs_f64(),
-        reads as f64 / elapsed_warm.as_secs_f64()
-    );
-    println!("warm p50       {:.1} us", p(&warm_latencies, 50));
-    println!("warm p90       {:.1} us", p(&warm_latencies, 90));
-    println!("warm p99       {:.1} us", p(&warm_latencies, 99));
+    println!("first read     {:.3} ms", first_read.as_secs_f64() * 1e3);
+    for (label, elapsed, latencies) in
+        [("cold", cold_elapsed, &cold), ("warm", warm_elapsed, &warm)]
+    {
+        println!(
+            "{label} elapsed   {:.3} s ({:.1} reads/s)",
+            elapsed.as_secs_f64(),
+            reads as f64 / elapsed.as_secs_f64()
+        );
+        for pct in [50, 90, 99] {
+            println!("{label} p{pct}       {:.1} us", percentile(latencies, pct));
+        }
+    }
     println!();
     print!("{}", reader.metrics().report());
     Ok(())

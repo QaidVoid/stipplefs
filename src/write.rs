@@ -601,23 +601,15 @@ impl Builder {
         if self.order == FileOrder::Extension {
             // Files added as bytes carry no path, so they sort before every
             // path and keep their relative order among themselves.
-            type Key<'a> = (
-                Option<Option<&'a std::ffi::OsStr>>,
-                Option<Option<&'a std::ffi::OsStr>>,
-            );
-            placements.sort_by(|a, b| {
-                let key_a: Key<'_> = match &a.1 {
-                    Pending::Bytes(_) => (None, None),
+            type Name<'a> = Option<&'a std::ffi::OsStr>;
+            fn key<'a>(p: &'a Pending<'_>) -> Option<(Name<'a>, Name<'a>)> {
+                match p {
+                    Pending::Bytes(_) => None,
                     #[cfg(feature = "fs")]
-                    Pending::Path(p) => (Some(p.extension()), Some(p.file_name())),
-                };
-                let key_b: Key<'_> = match &b.1 {
-                    Pending::Bytes(_) => (None, None),
-                    #[cfg(feature = "fs")]
-                    Pending::Path(p) => (Some(p.extension()), Some(p.file_name())),
-                };
-                key_a.cmp(&key_b)
-            });
+                    Pending::Path(p) => Some((p.extension(), p.file_name())),
+                }
+            }
+            placements.sort_by(|a, b| key(&a.1).cmp(&key(&b.1)));
         }
 
         if !plan.hot_rank.is_empty() {

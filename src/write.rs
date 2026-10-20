@@ -246,9 +246,42 @@ pub type Xattr = (Vec<u8>, Vec<u8>);
 /// The set of extended attributes an entry carries, sorted by name.
 pub type XattrSet = Vec<Xattr>;
 
+/// How far a build has got, reported as it advances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// File contents are being chunked and deduplicated into the stream.
+    Placing {
+        /// Files placed so far.
+        files: u64,
+        /// Files to place.
+        total_files: u64,
+        /// Bytes of file content read so far.
+        bytes: u64,
+    },
+    /// A dictionary is being trained from samples of the stream.
+    Training,
+    /// Blocks are being compressed.
+    Compressing {
+        /// Blocks compressed so far.
+        blocks: u64,
+        /// Blocks to compress.
+        total_blocks: u64,
+        /// Decoded bytes of the blocks compressed so far.
+        input_bytes: u64,
+        /// Stored bytes of the blocks compressed so far.
+        output_bytes: u64,
+    },
+    /// The finished image is being written out.
+    Writing,
+}
+
+/// Receives [`Progress`] reports, possibly from several threads at once.
+type ProgressFn = Box<dyn Fn(Progress) + Send + Sync>;
+
 /// Collects a tree and turns it into an image.
 pub struct Builder {
     options: Options,
+    progress: Option<ProgressFn>,
     order: FileOrder,
     root: Dir,
     /// Extended attributes, keyed by the same path used to insert the entry.
@@ -287,6 +320,7 @@ impl Builder {
         }
         Ok(Builder {
             options,
+            progress: None,
             order: FileOrder::default(),
             root: Dir {
                 mode: 0o755,
@@ -300,6 +334,20 @@ impl Builder {
     /// Set how files are ordered in the stream before chunking.
     pub fn set_order(&mut self, order: FileOrder) {
         self.order = order;
+    }
+
+    /// Report progress to `f` while the image is built.
+    ///
+    /// Compression reports arrive from worker threads, one per block, so `f`
+    /// should be cheap and do its own rate limiting if it prints.
+    pub fn set_progress(&mut self, f: impl Fn(Progress) + Send + Sync + 'static) {
+        self.progress = Some(Box::new(f));
+    }
+
+    fn report(&self, p: Progress) {
+        if let Some(f) = &self.progress {
+            f(p);
+        }
     }
 
     /// Record a modification time for the entry at `path`, in seconds.
@@ -769,7 +817,9 @@ impl Builder {
         plan: &mut Plan,
         cfg: &ChunkerConfig,
     ) -> Result<()> {
-        for (ino, pending) in placements {
+        let total_files = placements.len() as u64;
+        let mut bytes = 0u64;
+        for (done, (ino, pending)) in placements.iter().enumerate() {
             let content: std::borrow::Cow<'_, [u8]> = match pending {
                 Pending::Bytes(bytes) => std::borrow::Cow::Borrowed(bytes),
                 #[cfg(feature = "fs")]
@@ -780,6 +830,12 @@ impl Builder {
             rec.size = content.len() as u64;
             rec.payload = payload;
             rec.extent_count = extent_count;
+            bytes += content.len() as u64;
+            self.report(Progress::Placing {
+                files: done as u64 + 1,
+                total_files,
+                bytes,
+            });
         }
         Ok(())
     }
@@ -1085,10 +1141,20 @@ impl Builder {
     /// Each worker takes a contiguous run and results are reassembled in index
     /// order, so the output does not depend on the thread count or on which
     /// worker finishes first.
-    fn encode_blocks(&self, blocks: &[&[u8]], dict: Option<&[u8]>) -> Vec<(Codec, Vec<u8>)> {
+    fn encode_blocks(
+        &self,
+        blocks: &[&[u8]],
+        dict: Option<&[u8]>,
+        done: &(dyn Fn(usize, usize) + Sync),
+    ) -> Vec<(Codec, Vec<u8>)> {
+        let encode = |b: &&[u8]| {
+            let r = self.encode_block(b, dict);
+            done(b.len(), r.1.len());
+            r
+        };
         let threads = self.options.threads.clamp(1, blocks.len().max(1));
         if threads == 1 {
-            return blocks.iter().map(|b| self.encode_block(b, dict)).collect();
+            return blocks.iter().map(encode).collect();
         }
         let per = blocks.len().div_ceil(threads);
         let parts: Vec<&[&[u8]]> = blocks.chunks(per).collect();
@@ -1096,13 +1162,7 @@ impl Builder {
         std::thread::scope(|scope| {
             let handles: Vec<_> = parts
                 .iter()
-                .map(|part| {
-                    scope.spawn(move || {
-                        part.iter()
-                            .map(|b| self.encode_block(b, dict))
-                            .collect::<Vec<_>>()
-                    })
-                })
+                .map(|part| scope.spawn(move || part.iter().map(encode).collect::<Vec<_>>()))
                 .collect();
             for h in handles {
                 match h.join() {
@@ -1135,6 +1195,7 @@ impl Builder {
             {
                 return Ok(None);
             }
+            self.report(Progress::Training);
             const TARGET_SAMPLES: usize = 128;
             const SAMPLE_BYTES: usize = 256 * 1024;
             let stride = block_count.div_ceil(TARGET_SAMPLES).max(1);
@@ -1271,6 +1332,7 @@ impl Builder {
         let d = digest(&sb[..Superblock::CHECKSUM_OFFSET]);
         sb[Superblock::CHECKSUM_OFFSET..].copy_from_slice(&d.to_le_bytes());
 
+        self.report(Progress::Writing);
         out.write_all(&sb)?;
         let mut written = ALIGNMENT;
         for (_, content) in &sections {
@@ -1310,6 +1372,23 @@ impl Builder {
         let stream_len = stream.len;
         let batch = self.batch_size(block_size);
         let mut blocks = Vec::with_capacity(block_count);
+        self.report(Progress::Compressing {
+            blocks: 0,
+            total_blocks: block_count as u64,
+            input_bytes: 0,
+            output_bytes: 0,
+        });
+        let progress = std::sync::Mutex::new((0u64, 0u64, 0u64));
+        let done = |input: usize, output: usize| {
+            let Ok(mut p) = progress.lock() else { return };
+            *p = (p.0 + 1, p.1 + input as u64, p.2 + output as u64);
+            self.report(Progress::Compressing {
+                blocks: p.0,
+                total_blocks: block_count as u64,
+                input_bytes: p.1,
+                output_bytes: p.2,
+            });
+        };
         let mut index = 0;
         while index < block_count {
             let n = batch.min(block_count - index);
@@ -1322,7 +1401,7 @@ impl Builder {
                 raw.push(b);
             }
             let refs: Vec<&[u8]> = raw.iter().map(|b| b.as_slice()).collect();
-            let encoded = self.encode_blocks(&refs, dict);
+            let encoded = self.encode_blocks(&refs, dict, &done);
             for ((codec, enc), decoded) in encoded.iter().zip(&raw) {
                 blocks.push(EncodedBlock {
                     codec: *codec,

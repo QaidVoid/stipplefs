@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use stipplefs::format::Codec;
-use stipplefs::write::{Builder, Options, Timestamps};
+use stipplefs::write::{Builder, Options, Progress, Timestamps};
 
 #[derive(Parser)]
 #[command(
@@ -124,7 +124,16 @@ fn run(args: Args) -> Result<(), String> {
         compress_metadata: !args.no_compress && !args.no_compress_metadata,
     };
 
+    eprintln!(
+        "building {} from {}: block size {}, level {}, {} threads",
+        args.output.display(),
+        args.source.display(),
+        options.block_size,
+        options.level,
+        options.threads,
+    );
     let mut builder = Builder::new(options).map_err(|e| e.to_string())?;
+    builder.set_progress(progress_printer());
     builder.set_order(match args.order {
         OrderArg::Walk => stipplefs::write::FileOrder::Walk,
         OrderArg::Ext => stipplefs::write::FileOrder::Extension,
@@ -170,6 +179,105 @@ fn run(args: Args) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Print build progress to standard error.
+///
+/// A terminal gets one line rewritten in place a few times a second. Anything
+/// else, such as a CI log, gets a line when a stage starts or ends and every
+/// few seconds between, so the log stays readable.
+fn progress_printer() -> impl Fn(Progress) + Send + Sync + 'static {
+    use std::io::IsTerminal;
+    use std::time::{Duration, Instant};
+
+    struct State {
+        started: Instant,
+        compressing_since: Option<Instant>,
+        printed_at: Option<Instant>,
+        stage: Option<std::mem::Discriminant<Progress>>,
+        open_line: bool,
+    }
+
+    let tty = std::io::stderr().is_terminal();
+    let interval = Duration::from_millis(if tty { 100 } else { 5000 });
+    let state = std::sync::Mutex::new(State {
+        started: Instant::now(),
+        compressing_since: None,
+        printed_at: None,
+        stage: None,
+        open_line: false,
+    });
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+
+    move |p| {
+        let Ok(mut st) = state.lock() else { return };
+        let now = Instant::now();
+        let stage = std::mem::discriminant(&p);
+        let changed = st.stage != Some(stage);
+        let finished = match p {
+            Progress::Placing {
+                files, total_files, ..
+            } => files == total_files,
+            Progress::Compressing {
+                blocks,
+                total_blocks,
+                ..
+            } => blocks == total_blocks,
+            Progress::Training | Progress::Writing => true,
+        };
+        let due = st.printed_at.is_none_or(|t| now - t >= interval);
+        if !changed && !finished && !due {
+            return;
+        }
+        if matches!(p, Progress::Compressing { .. }) && st.compressing_since.is_none() {
+            st.compressing_since = Some(now);
+        }
+        let line = match p {
+            Progress::Placing {
+                files,
+                total_files,
+                bytes,
+            } => format!(
+                "placing      {files}/{total_files} files, {:.1} MiB read",
+                mib(bytes)
+            ),
+            Progress::Training => "training     dictionary".to_string(),
+            Progress::Compressing {
+                blocks,
+                total_blocks,
+                input_bytes,
+                output_bytes,
+            } => {
+                let secs = st
+                    .compressing_since
+                    .map_or(0.0, |t| (now - t).as_secs_f64())
+                    .max(1e-3);
+                format!(
+                    "compressing  {blocks}/{total_blocks} blocks, {:.1} -> {:.1} MiB ({:.1}%), {:.1} MiB/s",
+                    mib(input_bytes),
+                    mib(output_bytes),
+                    100.0 * output_bytes as f64 / input_bytes.max(1) as f64,
+                    mib(input_bytes) / secs,
+                )
+            }
+            Progress::Writing => "writing      image".to_string(),
+        };
+        let elapsed = (now - st.started).as_secs_f64();
+        if tty {
+            if changed && st.open_line {
+                eprintln!();
+            }
+            eprint!("\r\x1b[K[{elapsed:7.1}s] {line}");
+            st.open_line = !finished;
+            if finished {
+                eprintln!();
+            }
+        } else {
+            eprintln!("[{elapsed:7.1}s] {line}");
+        }
+        st.printed_at = Some(now);
+        st.stage = Some(stage);
+    }
 }
 
 fn main() -> ExitCode {

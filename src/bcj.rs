@@ -25,6 +25,32 @@ const fn is_ms_byte(b: u8) -> bool {
 /// How many of the low mask bits name the byte to fix up.
 const MASK_TO_BIT_NUMBER: [u32; 5] = [0, 1, 2, 2, 3];
 
+/// The first position at or after `pos` that may hold `E8` or `E9`, skipping
+/// eight bytes at a time.
+///
+/// Bytes that are neither opcode leave the filter's state alone, so skipping
+/// them changes nothing. Call and jump opcodes are a few percent of x86 code,
+/// and testing each byte in turn cost as much as decompressing the block. The
+/// returned position may hold some other byte; the caller still checks it.
+#[inline]
+fn next_candidate(buf: &[u8], mut pos: usize) -> usize {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    while let Some(bytes) = buf.get(pos..pos + 8) {
+        let word = u64::from_le_bytes(bytes.try_into().unwrap());
+        // A byte is zero here exactly when it is E8 or E9.
+        let x = (word & 0xFEFE_FEFE_FEFE_FEFE) ^ 0xE8E8_E8E8_E8E8_E8E8;
+        // The lowest flagged byte is the first zero byte; flags above it may
+        // be borrows, which only means stopping early.
+        let zero = x.wrapping_sub(LOW) & !x & HIGH;
+        if zero != 0 {
+            return pos + (zero.trailing_zeros() / 8) as usize;
+        }
+        pos += 8;
+    }
+    pos
+}
+
 /// Convert call and jump operands in `buf` in place.
 ///
 /// With `encode` set, relative displacements become absolute targets.
@@ -42,6 +68,10 @@ pub fn convert(buf: &mut [u8], encode: bool) {
     let mut pos: usize = 0;
 
     while pos <= limit {
+        pos = next_candidate(buf, pos);
+        if pos > limit {
+            break;
+        }
         let opcode = buf[pos];
         if opcode != 0xE8 && opcode != 0xE9 {
             pos += 1;
@@ -171,6 +201,103 @@ mod tests {
         }
         out.truncate(n);
         out
+    }
+
+    /// The filter as first written, testing every byte in turn.
+    fn convert_bytewise(buf: &mut [u8], encode: bool) {
+        let size = buf.len();
+        if size < 5 {
+            return;
+        }
+
+        let mut prev_mask: u32 = 0;
+        let mut prev_pos: u32 = 0u32.wrapping_sub(5);
+        let limit = size - 5;
+        let mut pos: usize = 0;
+
+        while pos <= limit {
+            let opcode = buf[pos];
+            if opcode != 0xE8 && opcode != 0xE9 {
+                pos += 1;
+                continue;
+            }
+
+            let offset = (pos as u32).wrapping_sub(prev_pos);
+            prev_pos = pos as u32;
+
+            if offset > 5 {
+                prev_mask = 0;
+            } else {
+                for _ in 0..offset {
+                    prev_mask &= 0x77;
+                    prev_mask <<= 1;
+                }
+            }
+
+            let tail = buf[pos + 4];
+
+            if is_ms_byte(tail) && (prev_mask >> 1) <= 4 && (prev_mask >> 1) != 3 {
+                let mut src = ((tail as u32) << 24)
+                    | ((buf[pos + 3] as u32) << 16)
+                    | ((buf[pos + 2] as u32) << 8)
+                    | (buf[pos + 1] as u32);
+
+                let dest = loop {
+                    let d = if encode {
+                        src.wrapping_add(pos as u32 + 5)
+                    } else {
+                        src.wrapping_sub(pos as u32 + 5)
+                    };
+                    if prev_mask == 0 {
+                        break d;
+                    }
+                    let i = MASK_TO_BIT_NUMBER[(prev_mask >> 1) as usize];
+                    let b = (d >> (24 - i * 8)) as u8;
+                    if !is_ms_byte(b) {
+                        break d;
+                    }
+                    src = d ^ ((1u32 << (32 - i * 8)).wrapping_sub(1));
+                };
+
+                buf[pos + 4] = if (dest >> 24) & 1 == 1 { 0xFF } else { 0 };
+                buf[pos + 3] = (dest >> 16) as u8;
+                buf[pos + 2] = (dest >> 8) as u8;
+                buf[pos + 1] = dest as u8;
+                pos += 5;
+                prev_mask = 0;
+            } else {
+                pos += 1;
+                prev_mask |= 1;
+                if is_ms_byte(tail) {
+                    prev_mask |= 0x10;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_the_bytewise_filter() {
+        for seed in 1..40u64 {
+            for data in [
+                code(20_000 + seed as usize * 13, seed),
+                corpus(20_000 + seed as usize * 7, seed),
+            ] {
+                for direction in [true, false] {
+                    let mut fast = data.clone();
+                    let mut slow = data.clone();
+                    convert(&mut fast, direction);
+                    convert_bytewise(&mut slow, direction);
+                    assert_eq!(fast, slow, "seed {seed}");
+                }
+            }
+        }
+        for n in 0..40 {
+            let mut fast = vec![0xE8u8; n];
+            let mut slow = fast.clone();
+            convert(&mut fast, true);
+            convert_bytewise(&mut slow, true);
+            assert_eq!(fast, slow, "length {n}");
+        }
     }
 
     #[test]

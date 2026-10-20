@@ -335,6 +335,9 @@ impl Warm {
         }
         if all {
             self.done[i].store(true, Ordering::Relaxed);
+            // Every byte is in the page cache now, so no read needs it.
+            drop(bytes);
+            self.reader.forget_block(block);
         }
     }
 

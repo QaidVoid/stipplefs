@@ -1054,6 +1054,12 @@ impl<'i> Reader<'i> {
         self.block(index, false)
     }
 
+    /// Drop block `index` from the cache, for a caller that knows no read
+    /// will want it again soon.
+    pub fn forget_block(&self, index: u32) {
+        self.cache.remove(index);
+    }
+
     /// The block holding byte `offset` of regular file `ino`, or `None` when
     /// the file has no byte there.
     pub fn block_of(&self, ino: u32, offset: u64) -> Option<u32> {

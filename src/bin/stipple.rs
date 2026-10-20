@@ -34,16 +34,17 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         threads: usize,
         /// Background threads decoding blocks and storing their file bytes
-        /// in the kernel's page cache. Zero serves every read on demand.
-        #[arg(long, default_value_t = 0)]
-        warm_workers: usize,
+        /// in the kernel's page cache, defaulting to one per core up to
+        /// eight. Zero serves every read on demand.
+        #[arg(long)]
+        warm_workers: Option<usize>,
         /// Blocks past each read to warm ahead of it.
         #[arg(long, default_value_t = 2)]
         warm_ahead: u32,
         /// Blocks at the front of the stream to warm as soon as the mount
-        /// exists.
-        #[arg(long, default_value_t = 0)]
-        warm_start: u32,
+        /// exists, defaulting to those holding the image's hot region.
+        #[arg(long)]
+        warm_start: Option<u32>,
     },
     /// Time random reads served directly by the library, without FUSE.
     Bench {
@@ -435,15 +436,20 @@ fn extract(located: Located, destination: PathBuf, subtree: Option<String>) -> R
     Ok(())
 }
 
+/// Most warming threads used unless asked for more. Past this, a starting
+/// application was no faster and the extra decodes only competed with it.
+#[cfg(feature = "mount")]
+const MAX_WARM_WORKERS: usize = 8;
+
 #[cfg(feature = "mount")]
 fn mount(
     located: Located,
     mountpoint: PathBuf,
     allow_other: bool,
     threads: usize,
-    warm_workers: usize,
+    warm_workers: Option<usize>,
     warm_ahead: u32,
-    warm_start: u32,
+    warm_start: Option<u32>,
 ) -> Result<(), String> {
     // glibc raises its mmap threshold each time a large allocation is freed,
     // after which decoded blocks come from per-thread heaps that keep their
@@ -461,6 +467,13 @@ fn mount(
     let budget = located
         .cache_budget
         .unwrap_or_else(|| image.default_budget());
+    let sb = *image.superblock();
+    let warm_workers = warm_workers.unwrap_or_else(|| {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_WARM_WORKERS))
+    });
+    let warm_start = warm_start.unwrap_or_else(|| {
+        u32::try_from(sb.hot_length.div_ceil(sb.block_size as u64)).unwrap_or(u32::MAX)
+    });
     let fs = stipplefs::mount::Mount::new(image, budget).map_err(|e| e.to_string())?;
     let (fs, notifier) = if warm_workers > 0 {
         let mountpoint = std::fs::canonicalize(&mountpoint)

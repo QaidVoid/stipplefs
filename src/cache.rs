@@ -98,6 +98,21 @@ impl BlockCache {
         self.examined.load(Ordering::Relaxed)
     }
 
+    /// Drop block `index` if it is held, so its memory is freed at once.
+    ///
+    /// A block being decoded is left alone; it is cached as usual when the
+    /// decode finishes.
+    pub fn remove(&self, index: u32) {
+        let mut inner = self.lock();
+        if let Some(slot) = inner.ready.remove(&index) {
+            inner.order.remove(&(slot.class, slot.used_at));
+            inner.used -= slot.bytes.len();
+            if slot.class == STREAMED {
+                inner.streamed -= slot.bytes.len();
+            }
+        }
+    }
+
     /// Bytes currently held.
     pub fn used(&self) -> usize {
         self.lock().used
@@ -437,6 +452,25 @@ mod tests {
             h.join().unwrap();
         }
         assert!(cache.used() <= 8192);
+    }
+
+    #[test]
+    fn a_removed_block_frees_its_memory_and_decodes_again() {
+        let cache = BlockCache::new(1 << 20);
+        let calls = AtomicUsize::new(0);
+        let decode = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![3u8; 256])
+        };
+        cache.get_or_decode(0, false, decode).unwrap();
+        cache.get_or_decode(1, true, decode).unwrap();
+        cache.remove(0);
+        cache.remove(1);
+        cache.remove(7);
+        assert_eq!(cache.used(), 0);
+        cache.get_or_decode(0, false, decode).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(cache.used(), 256);
     }
 
     #[test]

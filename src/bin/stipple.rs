@@ -35,7 +35,7 @@ enum Command {
         threads: usize,
         /// Background threads decoding blocks and storing their file bytes
         /// in the kernel's page cache, defaulting to one per core up to
-        /// eight. Zero serves every read on demand.
+        /// twelve. Zero serves every read on demand.
         #[arg(long)]
         warm_workers: Option<usize>,
         /// Blocks past each read to warm ahead of it.
@@ -437,9 +437,9 @@ fn extract(located: Located, destination: PathBuf, subtree: Option<String>) -> R
 }
 
 /// Most warming threads used unless asked for more. Past this, a starting
-/// application was no faster and the extra decodes only competed with it.
+/// application was no faster and each extra thread held another block.
 #[cfg(feature = "mount")]
-const MAX_WARM_WORKERS: usize = 8;
+const MAX_WARM_WORKERS: usize = 12;
 
 #[cfg(feature = "mount")]
 fn mount(

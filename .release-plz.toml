@@ -19,7 +19,7 @@ git_release_body = """
 
 [[package]]
 name = "stipplefs"
-git_tag_name = "{{ version }}"
+git_tag_name = "v{{ version }}"
 git_release_enable = true
 
 [changelog]

@@ -475,8 +475,9 @@ output from identical input.
 
 An image with `FLAG_COMPRESSED_METADATA` clear is valid but non-canonical. The
 canonical encoding uses walk order for the stream; a writer that reorders it,
-for example with `mkstipple --order ext` or `mkstipple --hot-list`, produces a
-valid but non-canonical image.
+as `mkstipple` does by default or with `--hot-list`, produces a valid but
+non-canonical image. `mkstipple --order walk` without a hot list writes the
+canonical encoding.
 
 Rule 9 exists because a size tie between codecs would otherwise leave the
 choice to the writer's iteration order, which is not determined by content.

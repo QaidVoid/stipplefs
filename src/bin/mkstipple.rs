@@ -17,11 +17,13 @@ struct Args {
     source: PathBuf,
     /// Image to write.
     output: PathBuf,
-    /// Decoded size of a block, in bytes.
-    #[arg(long, default_value_t = 65536)]
+    /// Decoded size of a block, in bytes. Larger blocks compress better and
+    /// cost more to decode on first access.
+    #[arg(long, default_value_t = 32 << 20)]
     block_size: u32,
-    /// Target average deduplication chunk size, in bytes.
-    #[arg(long, default_value_t = 65536)]
+    /// Target average deduplication chunk size, in bytes. Small chunks find
+    /// duplicates that larger ones straddle.
+    #[arg(long, default_value_t = 4096)]
     chunk_size: u32,
     /// Compression level, for blocks and for compressed metadata.
     #[arg(long, default_value_t = 19)]
@@ -54,7 +56,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t = MtimePolicy::Preserve)]
     mtime: MtimePolicy,
     /// How to order files before placing them into the stream.
-    #[arg(long, value_enum, default_value_t = OrderArg::Walk)]
+    #[arg(long, value_enum, default_value_t = OrderArg::Ext)]
     order: OrderArg,
     /// File naming, one path per line relative to the source, the files to
     /// place first in the stream, in that order. Typically the files an
@@ -69,9 +71,9 @@ const DICTIONARY_BLOCK_LIMIT: u32 = 1 << 20;
 /// How `--order` is spelled on the command line.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum OrderArg {
-    /// Pre-order tree walk order (format canonical default).
+    /// Pre-order tree walk order, the format's canonical encoding.
     Walk,
-    /// Group files by extension and filename.
+    /// Group files by extension and filename, which compresses better.
     Ext,
 }
 

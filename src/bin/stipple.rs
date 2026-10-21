@@ -657,6 +657,20 @@ fn bench(located: Located, reads: usize, read_size: usize, seed: u64) -> Result<
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    #[cfg(feature = "mount")]
+    let mounting = matches!(args.command, Command::Mount { .. });
+    #[cfg(not(feature = "mount"))]
+    let mounting = false;
+    // Rust ignores SIGPIPE, so output cut short by a closed pipe, as in
+    // `stipple check image | head`, would panic instead of ending quietly. A
+    // mount keeps ignoring it, so a closed log pipe cannot take it down.
+    if !mounting {
+        // SAFETY: restoring the default disposition of one signal, before any
+        // other thread exists.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     let outcome = match args.command {
         Command::Check(located) => check(located),
         Command::Bench {

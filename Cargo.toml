@@ -3,6 +3,12 @@ name = "stipplefs"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+description = "A read-only, compressed, deduplicating filesystem image format"
+repository = "https://github.com/QaidVoid/stipplefs"
+readme = "README.md"
+keywords = ["filesystem", "image", "compression", "deduplication", "fuse"]
+categories = ["filesystem", "compression"]
+exclude = ["/docs", "/scripts"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"], optional = true }

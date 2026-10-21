@@ -441,6 +441,24 @@ fn extract(located: Located, destination: PathBuf, subtree: Option<String>) -> R
 #[cfg(feature = "mount")]
 const MAX_WARM_WORKERS: usize = 12;
 
+/// Block the signals that ask the process to stop, in this thread and every
+/// thread started from it afterwards, so only a `sigwait` on the returned set
+/// receives them.
+#[cfg(feature = "mount")]
+fn block_stop_signals() -> libc::sigset_t {
+    // SAFETY: the set is initialised by sigemptyset before any other use, and
+    // pthread_sigmask only changes this thread's signal mask.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::sigaddset(&mut set, signal);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        set
+    }
+}
+
 #[cfg(feature = "mount")]
 fn mount(
     located: Located,
@@ -461,6 +479,7 @@ fn mount(
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
     }
+    let stop = block_stop_signals();
     use fuser::{Config, MountOption, SessionACL};
 
     let image = located.open()?;
@@ -500,8 +519,20 @@ fn mount(
     config.clone_fd = threads > 1;
     let reader = fs.reader();
     eprintln!("mounted on {}, interrupt to unmount", mountpoint.display());
-    let session =
+    let mut session =
         fuser::Session::new(fs, &mountpoint, &config).map_err(|e| format!("mounting: {e}"))?;
+    // Dying on a signal would leave the mountpoint disconnected rather than
+    // unmounted, so a signal unmounts instead and the session ends normally.
+    let mut unmounter = session.unmount_callable();
+    std::thread::spawn(move || {
+        let mut signal = 0;
+        // SAFETY: `stop` is an initialised signal set and `signal` is a valid
+        // place for the received signal number.
+        unsafe { libc::sigwait(&stop, &mut signal) };
+        if let Err(e) = unmounter.unmount() {
+            eprintln!("unmounting: {e}");
+        }
+    });
     if let Some(cell) = notifier {
         let _ = cell.set(session.notifier());
     }

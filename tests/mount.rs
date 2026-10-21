@@ -545,3 +545,32 @@ fn warming_stores_exactly_the_bytes_each_file_holds() {
         );
     }
 }
+
+#[test]
+fn a_stop_signal_unmounts_rather_than_leaving_the_mount_disconnected() {
+    let Some((dir, _src, image)) = prepare("signal") else {
+        return;
+    };
+    for signal in ["INT", "TERM", "HUP"] {
+        let point = dir.join(format!("mnt-{signal}"));
+        let Some(mut m) = mount_image(&image, &point) else {
+            eprintln!("skipping: could not mount");
+            return;
+        };
+        let sent = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(m.child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        let status = m.child.wait().unwrap();
+        assert!(
+            status.success(),
+            "SIG{signal} ended the mount with {status}"
+        );
+        let left: Vec<_> = std::fs::read_dir(&point)
+            .unwrap_or_else(|e| panic!("SIG{signal} left {}: {e}", point.display()))
+            .collect();
+        assert!(left.is_empty(), "SIG{signal} left the image mounted");
+    }
+}

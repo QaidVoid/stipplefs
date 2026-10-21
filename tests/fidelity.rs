@@ -615,3 +615,131 @@ fn extraction_recreates_every_kind_it_is_allowed_to() {
         assert_eq!(got, kind, "{rel} came back as {got}");
     }
 }
+
+/// Mode, modification time and inode of every entry under `root`, keyed by
+/// the raw bytes of its path, with inodes renumbered in order of appearance so
+/// two trees can be compared.
+fn shape(root: &Path) -> BTreeMap<Vec<u8>, (u32, Option<u64>, usize)> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    fn visit(
+        dir: &Path,
+        rel: &[u8],
+        inodes: &mut Vec<u64>,
+        out: &mut BTreeMap<Vec<u8>, (u32, Option<u64>, usize)>,
+    ) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let mut key = rel.to_vec();
+            key.push(b'/');
+            key.extend_from_slice(path.file_name().unwrap().as_bytes());
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let id = match inodes.iter().position(|&i| i == meta.ino()) {
+                Some(id) => id,
+                None => {
+                    inodes.push(meta.ino());
+                    inodes.len() - 1
+                }
+            };
+            let is_link = meta.file_type().is_symlink();
+            let mode = if is_link { 0 } else { meta.mode() & 0o7777 };
+            let mtime = (!is_link).then_some(meta.mtime() as u64);
+            out.insert(key.clone(), (mode, mtime, id));
+            if meta.is_dir() {
+                visit(&path, &key, inodes, out);
+            }
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    visit(root, b"", &mut Vec::new(), &mut out);
+    out
+}
+
+#[test]
+fn extraction_restores_modes_times_hard_links_and_raw_names() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Scratch::new("restore");
+    let src = s.path("src");
+    let set = |p: &Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    let touch = |p: &Path, secs: u64| {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        std::fs::File::open(p).unwrap().set_modified(t).unwrap();
+    };
+
+    std::fs::create_dir_all(src.join("bin")).unwrap();
+    std::fs::create_dir_all(src.join("locked")).unwrap();
+    std::fs::write(src.join("bin/tool"), b"#!/bin/sh\n").unwrap();
+    std::fs::write(src.join("secret"), b"s").unwrap();
+    std::fs::write(src.join("locked/inside"), b"i").unwrap();
+    std::fs::write(src.join("shared"), b"one inode, two names").unwrap();
+    std::fs::hard_link(src.join("shared"), src.join("bin/also-shared")).unwrap();
+    let raw = src.join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+    std::fs::write(&raw, b"latin-1 name").unwrap();
+    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(b"caf\xe9"), src.join("to-raw"))
+        .unwrap();
+
+    set(&src.join("bin/tool"), 0o775);
+    set(&src.join("secret"), 0o600);
+    set(&src.join("locked/inside"), 0o444);
+    set(&src.join("shared"), 0o640);
+    for (i, p) in ["bin/tool", "secret", "locked/inside", "shared"]
+        .iter()
+        .enumerate()
+    {
+        touch(&src.join(p), 1_600_000_000 + i as u64);
+    }
+    touch(&raw, 1_600_000_100);
+    touch(&src.join("bin"), 1_500_000_000);
+    touch(&src.join("locked"), 1_500_000_001);
+    set(&src.join("locked"), 0o555);
+
+    let image = s.path("out.stipple");
+    let built = Command::new(MK)
+        .arg(&src)
+        .arg(&image)
+        .args(["--block-size", "4096", "--level", "3"])
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "mkstipple failed: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let dest = s.path("out");
+    let extracted = Command::new(ST)
+        .args(["extract"])
+        .arg(&image)
+        .arg(&dest)
+        .output()
+        .unwrap();
+    let before = shape(&src);
+    let after = shape(&dest);
+    set(&src.join("locked"), 0o755);
+    if dest.join("locked").exists() {
+        set(&dest.join("locked"), 0o755);
+    }
+    assert!(
+        extracted.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    assert_eq!(
+        std::fs::read_link(dest.join("to-raw"))
+            .unwrap()
+            .as_os_str()
+            .as_bytes(),
+        b"caf\xe9"
+    );
+    assert_eq!(before, after, "the extracted tree differs from the source");
+}

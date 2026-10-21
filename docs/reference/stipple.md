@@ -52,7 +52,7 @@ Mounts the image read-only and serves it until the mountpoint is unmounted. An i
 stipple extract <PATH> <DESTINATION>
 ```
 
-Writes the tree into `DESTINATION`, creating it if needed. Regular files, directories, symbolic links, named pipes, sockets and devices are recreated, along with modification times and extended attributes. Creating devices needs the privileges `mknod` needs.
+Writes the tree into `DESTINATION`, creating it if needed. Regular files, directories, symbolic links, named pipes, sockets and devices are recreated with their permissions, modification times and extended attributes, and names that share an inode in the image become hard links again. Names are written byte for byte, whatever their encoding. Ownership is left to the user running the extraction, and creating devices needs the privileges `mknod` needs.
 
 | Option | Meaning |
 |---|---|

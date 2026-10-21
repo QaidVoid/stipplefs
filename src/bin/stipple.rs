@@ -187,6 +187,14 @@ fn restore_xattrs(at: &Path, attrs: &[(&[u8], &[u8])]) -> Result<(), String> {
     Ok(())
 }
 
+/// Restore an entry's permission bits, which creating it filtered through
+/// the umask.
+fn restore_mode(at: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(at, std::fs::Permissions::from_mode(mode & 0o7777))
+        .map_err(|e| format!("{}: setting permissions: {e}", at.display()))
+}
+
 /// Restore an entry's modification time, without following a symlink.
 fn restore_mtime(at: &Path, seconds: u64) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
@@ -229,12 +237,10 @@ fn walk(
     prefix: &Path,
     visit: &mut impl FnMut(&Path, u32) -> Result<(), String>,
 ) -> Result<(), String> {
-    let children: Vec<(String, u32)> = r
-        .entries(ino)
-        .map(|(name, child)| (String::from_utf8_lossy(name).into_owned(), child))
-        .collect();
+    use std::os::unix::ffi::OsStrExt;
+    let children: Vec<(&[u8], u32)> = r.entries(ino).collect();
     for (name, child) in children {
-        let path = prefix.join(&name);
+        let path = prefix.join(std::ffi::OsStr::from_bytes(name));
         visit(&path, child)?;
         walk(r, child, &path, visit)?;
     }
@@ -345,6 +351,9 @@ fn check(located: Located) -> Result<(), String> {
 }
 
 fn extract(located: Located, destination: PathBuf, subtree: Option<String>) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+
     let image = located.open()?;
     let budget = located
         .cache_budget
@@ -355,6 +364,13 @@ fn extract(located: Located, destination: PathBuf, subtree: Option<String>) -> R
     let want = subtree.as_deref().map(Path::new);
 
     let mut wrote = 0u64;
+    // Creating an entry changes its directory's time, and a read-only
+    // directory refuses new entries, so directories get their mode and time
+    // once everything inside them exists.
+    let mut dirs: Vec<(PathBuf, u32, Option<u64>)> = Vec::new();
+    // Where the first name of each hard-linked inode was extracted.
+    let mut linked: std::collections::HashMap<u32, PathBuf> = std::collections::HashMap::new();
+    let mut buf = vec![0u8; 1 << 20];
     walk(&reader, 0, Path::new(""), &mut |path, ino| {
         if let Some(w) = want
             && !path.starts_with(w)
@@ -364,74 +380,72 @@ fn extract(located: Located, destination: PathBuf, subtree: Option<String>) -> R
         }
         let node = reader.inode(ino).ok_or("inode out of range")?;
         let target = destination.join(path);
-        match node.file_type() {
-            Some(FileType::Directory) => {
-                std::fs::create_dir_all(&target)
-                    .map_err(|e| format!("{}: {e}", target.display()))?;
+        let wanted = want.is_none_or(|w| path.starts_with(w));
+        let kind = node
+            .file_type()
+            .ok_or_else(|| format!("inode {ino} has an unrecognised type"))?;
+        if kind == FileType::Directory {
+            std::fs::create_dir_all(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+            if wanted {
+                let attrs = reader.xattrs(ino).map_err(|e| e.to_string())?;
+                restore_xattrs(&target, &attrs)?;
+                dirs.push((target, node.mode, node.mtime));
             }
-            Some(FileType::Symlink) => {
-                if want.is_some_and(|w| !path.starts_with(w)) {
-                    return Ok(());
-                }
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("{}: {e}", parent.display()))?;
-                }
+            return Ok(());
+        }
+        if !wanted {
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        let _ = std::fs::remove_file(&target);
+        if let Some(first) = linked.get(&ino) {
+            return std::fs::hard_link(first, &target)
+                .map_err(|e| format!("{}: {e}", target.display()));
+        }
+        match kind {
+            FileType::Symlink => {
                 let raw = reader.symlink_target(ino).ok_or("bad symlink target")?;
-                let text = String::from_utf8_lossy(raw).into_owned();
-                let _ = std::fs::remove_file(&target);
-                std::os::unix::fs::symlink(&text, &target)
+                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(raw), &target)
                     .map_err(|e| format!("{}: {e}", target.display()))?;
             }
-            Some(
-                kind @ (FileType::Fifo
-                | FileType::Socket
-                | FileType::CharDevice
-                | FileType::BlockDevice),
-            ) => {
-                if want.is_some_and(|w| !path.starts_with(w)) {
-                    return Ok(());
-                }
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("{}: {e}", parent.display()))?;
-                }
-                let _ = std::fs::remove_file(&target);
-                create_special(&target, kind, node.mode, node.device().unwrap_or(0))?;
-            }
-            Some(FileType::Regular) => {
-                if want.is_some_and(|w| !path.starts_with(w)) {
-                    return Ok(());
-                }
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("{}: {e}", parent.display()))?;
-                }
-                let mut out = vec![0u8; node.size as usize];
-                let mut at = 0usize;
-                while (at as u64) < node.size {
-                    let n = reader
-                        .read(ino, at as u64, &mut out[at..])
-                        .map_err(|e| e.to_string())?;
+            FileType::Regular => {
+                let fail = |e: std::io::Error| format!("{}: {e}", target.display());
+                let mut out = std::fs::File::create(&target).map_err(fail)?;
+                let mut at = 0u64;
+                while at < node.size {
+                    let n = reader.read(ino, at, &mut buf).map_err(|e| e.to_string())?;
                     if n == 0 {
                         break;
                     }
-                    at += n;
+                    out.write_all(&buf[..n]).map_err(fail)?;
+                    at += n as u64;
                 }
-                std::fs::write(&target, &out).map_err(|e| format!("{}: {e}", target.display()))?;
-                wrote += node.size;
+                wrote += at;
             }
-            None => return Err(format!("inode {ino} has an unrecognised type")),
+            FileType::Directory => unreachable!("handled above"),
+            special => create_special(&target, special, node.mode, node.device().unwrap_or(0))?,
         }
-        if want.is_none_or(|w| path.starts_with(w)) {
-            let attrs = reader.xattrs(ino).map_err(|e| e.to_string())?;
-            restore_xattrs(&target, &attrs)?;
-            if let Some(t) = node.mtime {
-                restore_mtime(&target, t)?;
-            }
+        let attrs = reader.xattrs(ino).map_err(|e| e.to_string())?;
+        restore_xattrs(&target, &attrs)?;
+        if kind != FileType::Symlink {
+            restore_mode(&target, node.mode)?;
+        }
+        if let Some(t) = node.mtime {
+            restore_mtime(&target, t)?;
+        }
+        if node.nlink > 1 {
+            linked.insert(ino, target);
         }
         Ok(())
     })?;
+    for (dir, mode, mtime) in dirs.iter().rev() {
+        restore_mode(dir, *mode)?;
+        if let Some(t) = mtime {
+            restore_mtime(dir, *t)?;
+        }
+    }
     eprintln!("extracted {wrote} bytes into {}", destination.display());
     Ok(())
 }

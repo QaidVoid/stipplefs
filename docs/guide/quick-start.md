@@ -90,7 +90,7 @@ fusermount3 -u ~/mnt/python
 
 ## Extract it
 
-To get a plain directory back, with symbolic links, special files, modification times and extended attributes restored:
+To get a plain directory back, with permissions, hard links, symbolic links, special files, modification times and extended attributes restored:
 
 ```sh
 stipple extract python.stipple ./python-copy

@@ -1133,7 +1133,7 @@ impl Builder {
         let size = |b: &(Codec, Option<Vec<u8>>)| b.1.as_ref().map_or(raw.len(), Vec::len);
         #[cfg(feature = "zstd")]
         if self.options.codecs & Codec::Zstd.bit() != 0
-            && let Ok(z) = zstd::encode_all(raw, self.options.level)
+            && let Some(z) = self.zstd_frame(raw, None)
             && z.len() < size(&best)
         {
             best = (Codec::Zstd, Some(z));
@@ -1141,8 +1141,7 @@ impl Builder {
         #[cfg(feature = "zstd")]
         if self.options.codecs & Codec::ZstdDict.bit() != 0
             && let Some(d) = dict
-            && let Ok(mut c) = zstd::bulk::Compressor::with_dictionary(self.options.level, d)
-            && let Ok(z) = c.compress(raw)
+            && let Some(z) = self.zstd_frame(raw, Some(d))
             && z.len() < size(&best)
         {
             best = (Codec::ZstdDict, Some(z));
@@ -1155,16 +1154,14 @@ impl Builder {
                 let mut filtered = raw.to_vec();
                 crate::bcj::encode(&mut filtered);
                 if bcj_plain
-                    && let Ok(z) = zstd::encode_all(&filtered[..], self.options.level)
+                    && let Some(z) = self.zstd_frame(&filtered, None)
                     && z.len() < size(&best)
                 {
                     best = (Codec::ZstdBcj, Some(z));
                 }
                 if bcj_dict
                     && let Some(d) = dict
-                    && let Ok(mut c) =
-                        zstd::bulk::Compressor::with_dictionary(self.options.level, d)
-                    && let Ok(z) = c.compress(&filtered)
+                    && let Some(z) = self.zstd_frame(&filtered, Some(d))
                     && z.len() < size(&best)
                 {
                     best = (Codec::ZstdDictBcj, Some(z));
@@ -1175,6 +1172,31 @@ impl Builder {
         let _ = dict;
         let (codec, bytes) = best;
         (codec, bytes.unwrap_or_else(|| raw.to_vec()))
+    }
+
+    /// One zstd frame of `data` at the configured level, against `dict` when
+    /// given, with a window covering the whole of `data`.
+    ///
+    /// Below level 20 zstd caps its window at 8 MiB whatever the input, so in
+    /// a larger block a match further back than that is never found. The
+    /// reader holds the whole block while decoding it anyway, so a wider
+    /// window costs it nothing. The window stops at 128 MiB, the most a zstd
+    /// decoder accepts without being told otherwise.
+    #[cfg(feature = "zstd")]
+    fn zstd_frame(&self, data: &[u8], dict: Option<&[u8]>) -> Option<Vec<u8>> {
+        let mut c = match dict {
+            Some(d) => zstd::bulk::Compressor::with_dictionary(self.options.level, d),
+            None => zstd::bulk::Compressor::new(self.options.level),
+        }
+        .ok()?;
+        let window = data
+            .len()
+            .next_power_of_two()
+            .trailing_zeros()
+            .clamp(10, 27);
+        c.set_parameter(zstd::zstd_safe::CParameter::WindowLog(window))
+            .ok()?;
+        c.compress(data).ok()
     }
 
     /// Compress every block, optionally across several threads.

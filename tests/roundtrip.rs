@@ -417,3 +417,25 @@ fn a_hot_list_places_its_files_first_in_the_order_given() {
         assert_eq!(&r.read_all(r.resolve(path).unwrap()).unwrap(), want);
     }
 }
+
+#[cfg(feature = "fs")]
+#[test]
+fn a_file_inserted_by_path_round_trips() {
+    let dir = std::env::temp_dir().join(format!("stipplefs-insert-at-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("source.bin");
+    let content = pattern(200_000, 3);
+    std::fs::write(&source, &content).unwrap();
+
+    let mut b = Builder::new(Options::default()).unwrap();
+    b.insert_file_at(b"lib/app.so", &source, 0o755, 0, 0)
+        .unwrap();
+    let image = b.build().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+    let r = img.reader().unwrap();
+    let ino = r.resolve(b"lib/app.so").unwrap();
+    assert_eq!(r.inode(ino).unwrap().mode & 0o7777, 0o755);
+    assert_eq!(read_all(&r, ino), content);
+}

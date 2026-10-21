@@ -1561,6 +1561,31 @@ impl Builder {
         self.add_dir(root, &[])
     }
 
+    /// Add a regular file at `path` whose bytes are read from `source` when
+    /// the image is built, rather than held in memory until then.
+    ///
+    /// For a caller that chooses the files itself instead of taking a whole
+    /// tree with [`Builder::add_tree`].
+    pub fn insert_file_at(
+        &mut self,
+        path: &[u8],
+        source: &std::path::Path,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<()> {
+        self.insert_tree(
+            path,
+            Tree::FileAt {
+                path: source.to_path_buf(),
+                mode,
+                uid,
+                gid,
+                link_group: None,
+            },
+        )
+    }
+
     fn add_dir(&mut self, dir: &std::path::Path, prefix: &[u8]) -> Result<()> {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt;

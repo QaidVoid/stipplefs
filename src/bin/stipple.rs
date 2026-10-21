@@ -648,8 +648,10 @@ fn bench(located: Located, reads: usize, read_size: usize, seed: u64) -> Result<
             println!("{label} p{pct}       {:.1} us", percentile(latencies, pct));
         }
     }
-    println!();
-    print!("{}", reader.metrics().report());
+    if cfg!(feature = "metrics") {
+        println!();
+        print!("{}", reader.metrics().report());
+    }
     Ok(())
 }
 

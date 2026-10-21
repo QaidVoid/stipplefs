@@ -1,4 +1,10 @@
 
+## [0.1.1](https://github.com/QaidVoid/stipplefs/compare/v0.1.0...v0.1.1) - 2026-10-21
+
+### ⚙️ Miscellaneous Tasks
+
+- Attach binaries to v-prefixed releases - ([627fac6](https://github.com/QaidVoid/stipplefs/commit/627fac6fbe46d04e7fd839319ee79f5c20551320))
+
 ## [0.1.0] - 2026-10-21
 
 ### ⛰️  Features

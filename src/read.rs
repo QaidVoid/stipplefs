@@ -188,10 +188,19 @@ pub(crate) fn parse_superblock(
     })
 }
 
+/// Largest metadata section an image accepts unless told otherwise, stored
+/// or decoded.
+///
+/// Sections are built in memory by a writer, so only a corrupt or hostile
+/// image comes near this. A caller reading an image it does not trust should
+/// lower it with [`Image::set_metadata_limit`].
+pub const DEFAULT_METADATA_LIMIT: u64 = 1 << 40;
+
 /// An opened image, validated as far as its superblock.
 pub struct Image<'a> {
     region: Region<'a>,
     superblock: Superblock,
+    metadata_limit: u64,
 }
 
 impl<'a> Image<'a> {
@@ -206,12 +215,28 @@ impl<'a> Image<'a> {
         let mut raw = [0u8; SUPERBLOCK_SIZE];
         region.read_at(0, &mut raw)?;
         let superblock = parse_superblock(&raw, region.size())?;
-        Ok(Image { region, superblock })
+        Ok(Image {
+            region,
+            superblock,
+            metadata_limit: DEFAULT_METADATA_LIMIT,
+        })
     }
 
     /// The validated superblock.
     pub fn superblock(&self) -> &Superblock {
         &self.superblock
+    }
+
+    /// Refuse any metadata section larger than `bytes`, as stored or once
+    /// decoded, before allocating for it.
+    ///
+    /// The superblock bounds a section only by the image's length, and a
+    /// compressed section declares its own decoded length, so an image from a
+    /// source that is not trusted can otherwise make a reader allocate far
+    /// more than it holds. Such a reader should set a limit close to the
+    /// metadata it expects.
+    pub fn set_metadata_limit(&mut self, bytes: u64) {
+        self.metadata_limit = bytes;
     }
 }
 
@@ -273,16 +298,16 @@ fn parse_inode_widths(section: &[u8], inode_count: u32) -> Result<InodeWidths> {
 /// frame. The frame decompresses to exactly the recorded length, or the image
 /// is malformed.
 #[cfg(feature = "zstd")]
-fn expand_section(stored: &[u8]) -> Result<Vec<u8>> {
+fn expand_section(stored: &[u8], limit: u64) -> Result<Vec<u8>> {
     if stored.len() < 8 {
         return Err(Error::Malformed {
             detail: "a compressed section is too short to hold its decoded length",
         });
     }
     let decoded_length = u64::from_le_bytes(stored[..8].try_into().unwrap());
-    if decoded_length > MAX_SECTION_BYTES {
+    if decoded_length > limit {
         return Err(Error::Malformed {
-            detail: "a compressed section declares an absurd decoded length",
+            detail: "a compressed section declares more than the metadata limit",
         });
     }
     let mut d = zstd::bulk::Decompressor::new()?;
@@ -299,15 +324,10 @@ fn expand_section(stored: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Sections are built in memory by the writer, so a decoded length beyond
-/// this can only be a corrupt length prefix.
-#[cfg(feature = "zstd")]
-const MAX_SECTION_BYTES: u64 = 1 << 40;
-
 /// A build without zstd cannot expand a compressed section, so any image
 /// that stores one is refused rather than misread.
 #[cfg(not(feature = "zstd"))]
-fn expand_section(_stored: &[u8]) -> Result<Vec<u8>> {
+fn expand_section(_stored: &[u8], _limit: u64) -> Result<Vec<u8>> {
     Err(Error::Malformed {
         detail: "the image stores compressed metadata but this build has no zstd support",
     })
@@ -415,6 +435,11 @@ impl<'a> Image<'a> {
                 detail: "a present section is too short to hold its digest",
             });
         }
+        if section.size - 8 > self.metadata_limit {
+            return Err(Error::Malformed {
+                detail: "a metadata section is larger than the metadata limit",
+            });
+        }
         let content_len = (section.size - 8) as usize;
 
         let compressed =
@@ -433,7 +458,7 @@ impl<'a> Image<'a> {
                 if !compressed {
                     return Ok(SectionData::Borrowed(c));
                 }
-                Ok(SectionData::Owned(expand_section(c)?))
+                Ok(SectionData::Owned(expand_section(c, self.metadata_limit)?))
             }
             None => {
                 // The digest follows the content, so one call fetches both,
@@ -450,7 +475,7 @@ impl<'a> Image<'a> {
                 if !compressed {
                     return Ok(SectionData::Owned(c));
                 }
-                Ok(SectionData::Owned(expand_section(&c)?))
+                Ok(SectionData::Owned(expand_section(&c, self.metadata_limit)?))
             }
         }
     }

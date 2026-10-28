@@ -436,12 +436,13 @@ impl<'a> Image<'a> {
                 Ok(SectionData::Owned(expand_section(c)?))
             }
             None => {
-                let mut c = vec![0u8; content_len];
+                // The digest follows the content, so one call fetches both,
+                // which halves the calls a remote source answers.
+                let mut c = vec![0u8; section.size as usize];
                 self.region.read_at(section.offset, &mut c)?;
-                let mut d = [0u8; 8];
-                self.region
-                    .read_at(section.offset + content_len as u64, &mut d)?;
-                if digest(&c) != u64::from_le_bytes(d) {
+                let d = le_u64(&c[content_len..]);
+                c.truncate(content_len);
+                if digest(&c) != d {
                     return Err(Error::ChecksumMismatch {
                         what: "metadata section",
                     });

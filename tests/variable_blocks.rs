@@ -10,7 +10,7 @@ use stipplefs::read::Image;
 use stipplefs::write::{Builder, Node, Options, Timestamps};
 
 fn noise(seed: u64, len: usize) -> Vec<u8> {
-    let mut x = seed | 1;
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
     (0..len)
         .map(|_| {
             x ^= x << 13;
@@ -229,4 +229,56 @@ fn an_index_digest_that_disagrees_with_the_block_is_refused() {
     let mut buf = vec![0u8; 20_000];
     let detail = malformed(reader.read(ino, 0, &mut buf));
     assert!(detail.contains("disagrees"), "{detail}");
+}
+
+#[test]
+fn a_file_of_a_block_or_more_has_blocks_of_its_own() {
+    let mut b = Builder::new(Options {
+        block_size: 64 * 1024,
+        chunk_average: 4096,
+        codecs: Codec::Stored.bit() | Codec::Zstd.bit(),
+        level: 3,
+        dictionary_size: 0,
+        threads: 1,
+        memory_limit: None,
+        timestamps: Timestamps::Clamp,
+        compress_metadata: false,
+        variable_blocks: true,
+    })
+    .unwrap();
+    for (name, seed, len) in [("a", 1, 20_000), ("b", 4, 200_000), ("c", 6, 20_000)] {
+        b.insert(
+            name.as_bytes(),
+            Node::File {
+                content: noise(seed, len),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                link_group: None,
+            },
+        )
+        .unwrap();
+    }
+    let image = b.build().unwrap();
+    let img = Image::new(image.clone(), 0, image.len() as u64).unwrap();
+    let reader = img.reader().unwrap();
+    let index = reader.blocks();
+    let starts: HashSet<u64> = (0..index.count()).filter_map(|i| index.start(i)).collect();
+
+    let ino = reader.resolve(b"b").unwrap();
+    let extents = reader.file_extents(ino);
+    let first = extents.first().unwrap().0;
+    let (last_stream, _, last_len) = *extents.last().unwrap();
+    let end = last_stream + last_len;
+    assert!(starts.contains(&first), "b does not start a block");
+    assert!(
+        starts.contains(&end) || end == img.superblock().stream_length,
+        "b does not end a block"
+    );
+    // The small files around it share no block with it.
+    for name in [b"a", b"c"] {
+        let ino = reader.resolve(name).unwrap();
+        let (stream, _, len) = reader.file_extents(ino)[0];
+        assert!(stream + len <= first || stream >= end);
+    }
 }

@@ -904,6 +904,12 @@ impl Builder {
         }
         let mut runs: Vec<(u64, u64, u32)> = Vec::new();
         let mut file_offset = 0u64;
+        // A file of a block or more gets blocks of its own, so a change to it
+        // does not drag the files on either side into the update, nor them
+        // it. Its first new chunk starts a block and its last ends one.
+        let own_blocks =
+            self.options.variable_blocks && content.len() as u64 >= self.options.block_size as u64;
+        let mut appended = false;
         for (off, len) in chunks(content, cfg) {
             let piece = &content[off..off + len];
             let key = twox_hash::XxHash3_128::oneshot(piece);
@@ -912,6 +918,10 @@ impl Builder {
                 None => {
                     let at = plan.stream.append(piece)?;
                     plan.seen.insert(key, at);
+                    if own_blocks && !appended && at > plan.cuts.last().copied().unwrap_or(0) {
+                        plan.cuts.push(at);
+                    }
+                    appended = true;
                     if self.options.variable_blocks {
                         self.cut(plan, cfg, at, len as u64, key);
                     }
@@ -925,6 +935,9 @@ impl Builder {
                 _ => runs.push((at, file_offset, len as u32)),
             }
             file_offset += len as u64;
+        }
+        if own_blocks && appended && plan.stream.len > plan.cuts.last().copied().unwrap_or(0) {
+            plan.cuts.push(plan.stream.len);
         }
         if runs.len() == 1 {
             return Ok((runs[0].0, 1));
@@ -941,8 +954,9 @@ impl Builder {
     /// block holds half of `block_size`, so blocks average about three
     /// quarters of it. Larger blocks cost less compression than they lose in
     /// reuse: measured on two VSCodium releases at 32 MiB, a quarter as the
-    /// floor made the image 1% larger, half made it 0.06% larger. Only content decides those ends. A block that reaches
-    /// `block_size` first ends there, and a chunk larger than that is split.
+    /// floor made the image 1% larger, half made it 0.06% larger. Only
+    /// content decides those ends. A block that reaches `block_size` first
+    /// ends there, and a chunk larger than that is split.
     fn cut(&self, plan: &mut Plan, cfg: &ChunkerConfig, at: u64, len: u64, key: u128) {
         let size = self.options.block_size as u64;
         let mut start = plan.cuts.last().copied().unwrap_or(0);

@@ -1,4 +1,24 @@
 
+## [0.1.1](https://github.com/QaidVoid/stipplefs/compare/v0.1.0...v0.1.1) - 2026-10-28
+
+### ⛰️  Features
+
+- *(format)* Add content-defined variable blocks - ([aa8acd9](https://github.com/QaidVoid/stipplefs/commit/aa8acd97ea086de315e548459a45a438715ae5be))
+- *(write)* Give files of a block or more their own blocks - ([8d21b0e](https://github.com/QaidVoid/stipplefs/commit/8d21b0efc6648bc06d90c32ba0bbdd235c26cf55))
+
+### 🐛 Bug Fixes
+
+- *(read)* Let a caller cap metadata from an image - ([fc46b42](https://github.com/QaidVoid/stipplefs/commit/fc46b426ae7193e3037fc2ed4643c05a20d7c908))
+- *(write)* Validate chunk_average - ([b4588df](https://github.com/QaidVoid/stipplefs/commit/b4588df1c709f2d595fb349700a8adedad5fbdfe))
+
+### ⚡ Performance
+
+- *(read)* Fetch a section and its digest in one read - ([1786f7a](https://github.com/QaidVoid/stipplefs/commit/1786f7aea2e0b74c3226ed121c94e306621da017))
+
+### ⚙️ Miscellaneous Tasks
+
+- Attach binaries to v-prefixed releases - ([627fac6](https://github.com/QaidVoid/stipplefs/commit/627fac6fbe46d04e7fd839319ee79f5c20551320))
+
 ## [0.1.0] - 2026-10-21
 
 ### ⛰️  Features

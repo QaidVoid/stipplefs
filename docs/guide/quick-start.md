@@ -53,7 +53,7 @@ stipple check python.stipple
 ```
 
 ```text
-format          1.3
+format          1.4
 image length    12959744
 stream length   56389916
 block size      33554432

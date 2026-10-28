@@ -112,7 +112,6 @@ struct Warm {
 
 impl Warm {
     fn new(reader: &'static Reader<'static>, mountpoint: PathBuf, depth: u32) -> Self {
-        let block_size = reader.superblock().block_size as u64;
         let inodes = reader.superblock().inode_count as usize;
         let blocks = reader.blocks().count() as usize;
 
@@ -145,10 +144,15 @@ impl Warm {
             by_file.push(found.len() as u32);
             for (mut stream, mut file_offset, mut left) in reader.file_extents(ino) {
                 while left > 0 {
-                    let within = stream % block_size;
-                    let len = left.min(block_size - within);
+                    let Some((block, within)) = reader.blocks().locate(stream) else {
+                        break;
+                    };
+                    let Some(entry) = reader.blocks().get(block) else {
+                        break;
+                    };
+                    let len = left.min(entry.decoded_length as u64 - within);
                     found.push(Piece {
-                        block: (stream / block_size) as u32,
+                        block,
                         ino,
                         within: within as u32,
                         len: len as u32,

@@ -111,7 +111,7 @@ fn build_check_and_extract_reproduce_the_tree() {
     );
     let report = String::from_utf8_lossy(&checked.stdout);
     assert!(
-        report.contains("format          1.3"),
+        report.contains("format          1.4"),
         "report was: {report}"
     );
     assert!(report.contains("verified"), "report was: {report}");

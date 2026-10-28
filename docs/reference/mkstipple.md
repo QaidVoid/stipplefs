@@ -28,6 +28,7 @@ mkstipple [OPTIONS] <SOURCE> <OUTPUT>
 | `--no-compress` | off | Store everything uncompressed, metadata included. |
 | `--no-bcj` | off | Skip the x86 branch filter, which drops both filtered codecs. |
 | `--no-compress-metadata` | off | Store metadata sections uncompressed. |
+| `--variable-blocks` | off | End blocks where the content says to, with `--block-size` as the largest, so unchanged content encodes to the same blocks across builds. |
 | `--dictionary-size <BYTES>` | 112 KiB up to 1 MiB blocks, none above | Largest dictionary to train. `0` disables training. |
 
 ## Metadata

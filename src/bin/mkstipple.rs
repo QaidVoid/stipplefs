@@ -37,6 +37,11 @@ struct Args {
     /// Store metadata sections uncompressed.
     #[arg(long)]
     no_compress_metadata: bool,
+    /// End blocks where the content says to, with `--block-size` as the
+    /// largest. Unchanged content then encodes to the same blocks across
+    /// builds, so an update can reuse them.
+    #[arg(long)]
+    variable_blocks: bool,
     /// Largest dictionary to train, in bytes. Zero disables training. Defaults
     /// to 112 KiB for blocks up to 1 MiB and to none above that, where a
     /// dictionary no longer makes blocks smaller and only costs time.
@@ -129,6 +134,7 @@ fn run(args: Args) -> Result<(), String> {
             MtimePolicy::Zero => Timestamps::Clamp,
         },
         compress_metadata: !args.no_compress && !args.no_compress_metadata,
+        variable_blocks: args.variable_blocks,
     };
 
     eprintln!(

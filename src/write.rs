@@ -10,10 +10,11 @@
 use crate::chunk::{ChunkerConfig, chunks};
 use crate::error::{Error, Result};
 use crate::format::{
-    ALIGNMENT, ATTR_ENTRY_SIZE, BLOCK_ENTRY_SIZE, Codec, DIRENT_SIZE, EXTENT_SIZE,
-    FLAG_COMPRESSED_METADATA, INODE_HEADER_SIZE, InodeWidths, KNOWN_CODEC_BITS, MAGIC,
-    MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK,
-    SECTION_COUNT, SUPERBLOCK_SIZE, SectionKind, Superblock, VERSION_MAJOR, VERSION_MINOR,
+    ALIGNMENT, ATTR_ENTRY_SIZE, BLOCK_ENTRY_SIZE, BLOCK_ENTRY_SIZE_VARIABLE, Codec, DIRENT_SIZE,
+    EXTENT_SIZE, FLAG_COMPRESSED_METADATA, FLAG_VARIABLE_BLOCKS, INODE_HEADER_SIZE, InodeWidths,
+    KNOWN_CODEC_BITS, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+    S_IFLNK, S_IFREG, S_IFSOCK, SECTION_COUNT, SUPERBLOCK_SIZE, SectionKind, Superblock,
+    VERSION_MAJOR, VERSION_MINOR,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -51,6 +52,11 @@ pub struct Options {
     /// Store the metadata sections as compressed frames. Requires the `zstd`
     /// feature; ignored without it.
     pub compress_metadata: bool,
+    /// End blocks where the content says to rather than every `block_size`
+    /// bytes, which then becomes the largest a block may be. Content that
+    /// does not change between two builds then lands in the same blocks and
+    /// encodes to the same bytes, wherever other content moved around it.
+    pub variable_blocks: bool,
 }
 
 /// How files are ordered in the stream before chunking.
@@ -91,6 +97,7 @@ impl Default for Options {
             memory_limit: None,
             timestamps: Timestamps::default(),
             compress_metadata: true,
+            variable_blocks: false,
         }
     }
 }
@@ -544,6 +551,8 @@ struct Plan {
     hot_rank: HashMap<u32, usize>,
     /// Stream bytes the hot list's files fill, once they are placed.
     hot_length: u64,
+    /// Stream offsets where variable blocks end, in ascending order.
+    cuts: Vec<u64>,
 }
 
 impl Plan {
@@ -561,6 +570,7 @@ impl Plan {
             xattr_index: HashMap::new(),
             hot_rank: HashMap::new(),
             hot_length: 0,
+            cuts: Vec::new(),
         }
     }
 
@@ -897,6 +907,9 @@ impl Builder {
                 None => {
                     let at = plan.stream.append(piece)?;
                     plan.seen.insert(key, at);
+                    if self.options.variable_blocks {
+                        self.cut(plan, cfg, at, len as u64, key);
+                    }
                     at
                 }
             };
@@ -914,6 +927,36 @@ impl Builder {
         let first = plan.extents.len() as u64;
         plan.extents.extend(runs.iter().copied());
         Ok((first, (plan.extents.len() as u64 - first) as u32))
+    }
+
+    /// Record where blocks end around a chunk of `len` bytes just appended
+    /// at stream offset `at`.
+    ///
+    /// A block ends after a chunk whose key has its low bits clear, once the
+    /// block holds half of `block_size`, so blocks average about three
+    /// quarters of it. Larger blocks cost less compression than they lose in
+    /// reuse: measured on two VSCodium releases at 32 MiB, a quarter as the
+    /// floor made the image 1% larger, half made it 0.06% larger. Only content decides those ends. A block that reaches
+    /// `block_size` first ends there, and a chunk larger than that is split.
+    fn cut(&self, plan: &mut Plan, cfg: &ChunkerConfig, at: u64, len: u64, key: u128) {
+        let size = self.options.block_size as u64;
+        let mut start = plan.cuts.last().copied().unwrap_or(0);
+        if at > start && at + len - start > size {
+            plan.cuts.push(at);
+            start = at;
+        }
+        while at + len - start > size {
+            start += size;
+            plan.cuts.push(start);
+        }
+        // At least one bit, so a chunk average large against `block_size`
+        // still leaves the end to the content rather than to the first
+        // chunk past the floor.
+        let mask = (size / (4 * cfg.average as u64)).max(1).ilog2().max(1);
+        let mask = (1u64 << mask) - 1;
+        if at + len - start >= size / 2 && (key >> 64) as u64 & mask == 0 {
+            plan.cuts.push(at + len);
+        }
     }
 }
 
@@ -1106,11 +1149,14 @@ impl Builder {
 
     /// The superblock flag bits this image is written with.
     fn superblock_flags(&self) -> u16 {
+        let mut flags = 0;
         if self.compress_metadata_enabled() {
-            FLAG_COMPRESSED_METADATA
-        } else {
-            0
+            flags |= FLAG_COMPRESSED_METADATA;
         }
+        if self.options.variable_blocks {
+            flags |= FLAG_VARIABLE_BLOCKS;
+        }
+        flags
     }
 }
 
@@ -1247,31 +1293,28 @@ impl Builder {
     fn train_dictionary(
         &self,
         stream: &Spill,
-        block_count: usize,
+        starts: &[u64],
         block_size: usize,
     ) -> Result<Option<Vec<u8>>> {
         #[cfg(feature = "dict")]
         {
             if self.options.dictionary_size == 0
                 || self.options.codecs & (Codec::ZstdDict.bit() | Codec::ZstdDictBcj.bit()) == 0
-                || block_count < 8
+                || starts.len() < 8
             {
                 return Ok(None);
             }
             self.report(Progress::Training);
             const TARGET_SAMPLES: usize = 128;
             const SAMPLE_BYTES: usize = 256 * 1024;
-            let stride = block_count.div_ceil(TARGET_SAMPLES).max(1);
+            let stride = starts.len().div_ceil(TARGET_SAMPLES).max(1);
             let width = block_size.min(SAMPLE_BYTES);
             let mut samples: Vec<Vec<u8>> = Vec::new();
-            let mut index = 0;
-            while index < block_count {
-                let at = (index * block_size) as u64;
+            for &at in starts.iter().step_by(stride) {
                 let len = (width as u64).min(stream.len - at) as usize;
                 let mut b = vec![0u8; len];
                 stream.read_at(at, &mut b)?;
                 samples.push(b);
-                index += stride;
             }
             if samples.len() < 8 {
                 return Ok(None);
@@ -1307,17 +1350,28 @@ impl Builder {
         let block_size = self.options.block_size as usize;
         plan.stream.flush()?;
         let stream_len = plan.stream.len;
-        let block_count = (stream_len as usize).div_ceil(block_size.max(1));
+        let starts: Vec<u64> = if stream_len == 0 {
+            Vec::new()
+        } else if self.options.variable_blocks {
+            std::iter::once(0)
+                .chain(plan.cuts.iter().copied().take_while(|&c| c < stream_len))
+                .collect()
+        } else {
+            (0..stream_len.div_ceil(block_size as u64))
+                .map(|i| i * block_size as u64)
+                .collect()
+        };
 
-        let dictionary = self.train_dictionary(&plan.stream, block_count, block_size)?;
-        let blocks = self.encode_stream(
-            &mut plan.stream,
-            block_count,
-            block_size,
-            dictionary.as_deref(),
-        )?;
+        let dictionary = self.train_dictionary(&plan.stream, &starts, block_size)?;
+        let blocks =
+            self.encode_stream(&mut plan.stream, &starts, block_size, dictionary.as_deref())?;
         plan.stream.flush()?;
-        let block_section_len = block_count * BLOCK_ENTRY_SIZE;
+        let entry_size = if self.options.variable_blocks {
+            BLOCK_ENTRY_SIZE_VARIABLE
+        } else {
+            BLOCK_ENTRY_SIZE
+        };
+        let block_section_len = starts.len() * entry_size;
 
         let mut sections: Vec<(SectionKind, Vec<u8>)> = Vec::new();
         for (kind, content) in [
@@ -1356,6 +1410,9 @@ impl Builder {
             block_index.extend_from_slice(&b.decoded_length.to_le_bytes());
             block_index.push(b.codec.id());
             block_index.extend_from_slice(&[0u8; 3]);
+            if self.options.variable_blocks {
+                block_index.extend_from_slice(&b.digest.to_le_bytes());
+            }
             at += b.encoded_length as u64 + 8;
         }
         if block_section_len > 0 {
@@ -1429,11 +1486,12 @@ impl Builder {
     fn encode_stream(
         &self,
         stream: &mut Spill,
-        block_count: usize,
+        starts: &[u64],
         block_size: usize,
         dict: Option<&[u8]>,
     ) -> Result<Vec<EncodedBlock>> {
         let stream_len = stream.len;
+        let block_count = starts.len();
         let batch = self.batch_size(block_size);
         let mut blocks = Vec::with_capacity(block_count);
         self.report(Progress::Compressing {
@@ -1457,9 +1515,9 @@ impl Builder {
         while index < block_count {
             let n = batch.min(block_count - index);
             let mut raw: Vec<Vec<u8>> = Vec::with_capacity(n);
-            for k in 0..n {
-                let at = ((index + k) * block_size) as u64;
-                let len = (block_size as u64).min(stream_len - at) as usize;
+            for k in index..index + n {
+                let at = starts[k];
+                let len = (starts.get(k + 1).copied().unwrap_or(stream_len) - at) as usize;
                 let mut b = vec![0u8; len];
                 stream.read_at(at, &mut b)?;
                 raw.push(b);

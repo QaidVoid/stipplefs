@@ -298,7 +298,11 @@ fn check(located: Located) -> Result<(), String> {
     println!("format          {}.{}", sb.version_major, sb.version_minor);
     println!("image length    {}", sb.image_length);
     println!("stream length   {}", sb.stream_length);
-    println!("block size      {}", sb.block_size);
+    if sb.flags & stipplefs::format::FLAG_VARIABLE_BLOCKS != 0 {
+        println!("block size      {} at most, variable", sb.block_size);
+    } else {
+        println!("block size      {}", sb.block_size);
+    }
     println!("hot region      {} bytes", sb.hot_length);
     println!("blocks          {}", sb.block_count);
     println!("inodes          {}", sb.inode_count);
@@ -473,6 +477,20 @@ fn block_stop_signals() -> libc::sigset_t {
     }
 }
 
+/// How many blocks the hot region spans, from the first.
+#[cfg(feature = "mount")]
+fn hot_blocks(image: &Image<'_>, hot_length: u64) -> u32 {
+    if hot_length == 0 {
+        return 0;
+    }
+    let Ok(blocks) = image.block_index() else {
+        return 0;
+    };
+    blocks
+        .locate(hot_length - 1)
+        .map_or(blocks.count(), |(index, _)| index + 1)
+}
+
 #[cfg(feature = "mount")]
 fn mount(
     located: Located,
@@ -504,9 +522,7 @@ fn mount(
     let warm_workers = warm_workers.unwrap_or_else(|| {
         std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_WARM_WORKERS))
     });
-    let warm_start = warm_start.unwrap_or_else(|| {
-        u32::try_from(sb.hot_length.div_ceil(sb.block_size as u64)).unwrap_or(u32::MAX)
-    });
+    let warm_start = warm_start.unwrap_or_else(|| hot_blocks(&image, sb.hot_length));
     let fs = stipplefs::mount::Mount::new(image, budget).map_err(|e| e.to_string())?;
     let (fs, notifier) = if warm_workers > 0 {
         let mountpoint = std::fs::canonicalize(&mountpoint)

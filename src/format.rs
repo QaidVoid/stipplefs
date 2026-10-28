@@ -15,8 +15,8 @@ pub const VERSION_MAJOR: u16 = 1;
 /// Minor format version this build writes.
 ///
 /// 2 adds the BCJ-filtered codecs and the compressed-metadata flag. 3 records
-/// how much of the stream a hot list fills.
-pub const VERSION_MINOR: u16 = 3;
+/// how much of the stream a hot list fills. 4 adds variable-length blocks.
+pub const VERSION_MINOR: u16 = 4;
 
 /// Lowest minor version this build can read.
 ///
@@ -76,6 +76,11 @@ impl SectionKind {
 /// [`SectionKind::is_compressible`] holds is stored as a zstd frame, prefixed
 /// by its decoded length. See `docs/format.md`.
 pub const FLAG_COMPRESSED_METADATA: u16 = 0x0001;
+
+/// Superblock flag: blocks have variable decoded lengths of at most
+/// `block_size`, each starting where the previous one ends, and every block
+/// index entry carries its block's digest. See `docs/format.md`.
+pub const FLAG_VARIABLE_BLOCKS: u16 = 0x0002;
 
 /// How a block's bytes are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +142,7 @@ impl Codec {
 pub const KNOWN_CODEC_BITS: u16 = (1 << (Codec::ZstdDictBcj.id() as u16 + 1)) - 1;
 
 /// Bitmask of every superblock flag the format defines.
-pub const KNOWN_FLAG_BITS: u16 = FLAG_COMPRESSED_METADATA;
+pub const KNOWN_FLAG_BITS: u16 = FLAG_COMPRESSED_METADATA | FLAG_VARIABLE_BLOCKS;
 
 /// Codecs this build can decode.
 ///
@@ -187,7 +192,8 @@ pub struct Superblock {
     pub image_length: u64,
     /// Total length of the logical stream.
     pub stream_length: u64,
-    /// Decoded size of a full block.
+    /// Decoded size of a full block, or the largest a block may decode to
+    /// under [`FLAG_VARIABLE_BLOCKS`].
     pub block_size: u32,
     /// Number of inodes.
     pub inode_count: u32,
@@ -216,6 +222,10 @@ impl Superblock {
 
 /// Size of one block index entry.
 pub const BLOCK_ENTRY_SIZE: usize = 20;
+
+/// Size of one block index entry in an image with [`FLAG_VARIABLE_BLOCKS`]:
+/// the fixed entry followed by the block's digest.
+pub const BLOCK_ENTRY_SIZE_VARIABLE: usize = 28;
 
 /// Size of the header that opens the inode table.
 pub const INODE_HEADER_SIZE: usize = 16;

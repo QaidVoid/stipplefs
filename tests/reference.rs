@@ -28,6 +28,11 @@ fn digest(b: &[u8]) -> u64 {
 struct Reference {
     image: Vec<u8>,
     block_size: u64,
+    /// Bytes per block index entry: 28 with variable blocks, 20 otherwise.
+    entry_size: usize,
+    /// Stream offset of every block, from the decoded lengths, when blocks
+    /// are variable.
+    starts: Option<Vec<u64>>,
     stream_length: u64,
     inode_count: u32,
     /// Every section, verified once when the image is opened.
@@ -76,8 +81,28 @@ impl Reference {
             }
         }
 
+        let variable = flags & 2 != 0;
+        let entry_size = if variable { 28 } else { 20 };
+        let starts = variable.then(|| {
+            let blocks = &sections[4];
+            let mut at = 0u64;
+            let mut starts = Vec::new();
+            for i in 0..u32at(&image, 44) as usize {
+                starts.push(at);
+                at += u32at(blocks, i * entry_size + 12) as u64;
+            }
+            assert_eq!(
+                at,
+                u64at(&image, 24),
+                "decoded lengths sum to stream_length"
+            );
+            starts
+        });
+
         Reference {
             block_size: u32at(&image, 32) as u64,
+            entry_size,
+            starts,
             stream_length: u64at(&image, 24),
             inode_count: u32at(&image, 36),
             sections,
@@ -137,7 +162,7 @@ impl Reference {
 
     fn decode_block(&self, index: usize) -> Vec<u8> {
         let blocks = self.section(4);
-        let at = index * 20;
+        let at = index * self.entry_size;
         let image_offset = u64at(blocks, at) as usize;
         let stored_length = u32at(blocks, at + 8) as usize;
         let decoded_length = u32at(blocks, at + 12) as usize;
@@ -146,6 +171,9 @@ impl Reference {
         let raw = &self.image[image_offset..image_offset + stored_length];
         let want = u64at(&self.image, image_offset + stored_length);
         assert_eq!(digest(raw), want, "block {index} digest");
+        if self.entry_size == 28 {
+            assert_eq!(u64at(blocks, at + 20), want, "block {index} index digest");
+        }
 
         let decoded: Vec<u8> = match codec {
             0 => raw.to_vec(),
@@ -181,8 +209,16 @@ impl Reference {
 
     fn stream_byte(&self, offset: u64) -> u8 {
         assert!(offset < self.stream_length);
-        let index = (offset / self.block_size) as usize;
-        let within = (offset % self.block_size) as usize;
+        let (index, within) = match &self.starts {
+            Some(starts) => {
+                let index = starts.partition_point(|&s| s <= offset) - 1;
+                (index, (offset - starts[index]) as usize)
+            }
+            None => (
+                (offset / self.block_size) as usize,
+                (offset % self.block_size) as usize,
+            ),
+        };
         let mut last = self.last.borrow_mut();
         if last.as_ref().map(|(i, _)| *i) != Some(index) {
             *last = Some((index, self.decode_block(index)));
@@ -382,7 +418,9 @@ fn every_writer_option_combination_round_trips() {
                         stipplefs::write::Timestamps::Preserve,
                     ] {
                         for memory_limit in [None, Some(1 << 20), Some(64 << 20)] {
-                            for compress_metadata in [false, true] {
+                            for (compress_metadata, variable_blocks) in
+                                [(false, false), (true, false), (false, true), (true, true)]
+                            {
                                 let opts = Options {
                                     block_size,
                                     chunk_average,
@@ -393,6 +431,7 @@ fn every_writer_option_combination_round_trips() {
                                     dictionary_size: 65536,
                                     timestamps,
                                     compress_metadata,
+                                    variable_blocks,
                                 };
                                 let (image, expected) = random_tree(9, opts);
                                 let reference = Reference::open(image.clone());
@@ -404,7 +443,8 @@ fn every_writer_option_combination_round_trips() {
                                         &expected[path],
                                         "block {block_size} chunk {chunk_average} codecs {codecs:#x} \
                                          threads {threads} timestamps {timestamps:?} \
-                                         memory {memory_limit:?} metadata {compress_metadata}"
+                                         memory {memory_limit:?} metadata {compress_metadata} \
+                                         variable {variable_blocks}"
                                     );
                                 }
                                 checked += 1;
@@ -415,7 +455,7 @@ fn every_writer_option_combination_round_trips() {
             }
         }
     }
-    assert_eq!(checked, 480);
+    assert_eq!(checked, 960);
 }
 
 /// A deliberately naive writer: no deduplication, no compression, one extent

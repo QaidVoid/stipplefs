@@ -1,4 +1,4 @@
-# The stipplefs image format, version 1.3
+# The stipplefs image format, version 1.4
 
 This document defines the on-disk format completely enough to write an
 independent reader. It is normative: where it says SHALL, a conforming reader
@@ -41,12 +41,12 @@ Occupies exactly 4096 bytes at image offset 0.
 |---|---|---|---|
 | 0 | 8 | `magic` | ASCII `STIPPLE\0`, bytes `53 54 49 50 50 4C 45 00` |
 | 8 | 2 | `version_major` | `1` for this document |
-| 10 | 2 | `version_minor` | `3` for this document |
+| 10 | 2 | `version_minor` | `4` for this document |
 | 12 | 2 | `flags` | superblock flags, see below |
 | 14 | 2 | `codec_mask` | bitmask of the block codecs used in the image |
 | 16 | 8 | `image_length` | total size of the image in bytes |
 | 24 | 8 | `stream_length` | total length of the logical stream |
-| 32 | 4 | `block_size` | decoded size of a full block, a power of two |
+| 32 | 4 | `block_size` | decoded size of a full block, a power of two; the most a block decodes to under `FLAG_VARIABLE_BLOCKS` |
 | 36 | 4 | `inode_count` | number of inodes |
 | 40 | 4 | `extent_count` | number of entries in the extent table |
 | 44 | 4 | `block_count` | number of entries in the block index |
@@ -62,10 +62,12 @@ Occupies exactly 4096 bytes at image offset 0.
 | Bit | Name | Meaning |
 |---|---|---|
 | `0x0001` | `FLAG_COMPRESSED_METADATA` | present compressible metadata sections are stored as compressed frames |
+| `0x0002` | `FLAG_VARIABLE_BLOCKS` | blocks vary in length and the block index records their digests, see Block index |
 
 Every other bit is reserved and SHALL be zero. A reader SHALL reject an image
 whose `flags` contains a bit it does not implement. A reader SHALL reject
-`FLAG_COMPRESSED_METADATA` on an image whose `version_minor` is below 2.
+`FLAG_COMPRESSED_METADATA` on an image whose `version_minor` is below 2, and
+`FLAG_VARIABLE_BLOCKS` on one whose `version_minor` is below 4.
 
 ### Section table
 
@@ -104,6 +106,7 @@ A reader SHALL reject the image unless all of the following hold:
 9. No bit is set in `flags` outside the flags this document defines.
 10. `FLAG_COMPRESSED_METADATA` is clear when `version_minor` is below 2.
 11. `hot_length` does not exceed `stream_length`.
+12. `FLAG_VARIABLE_BLOCKS` is clear when `version_minor` is below 4.
 
 Rule 8 is what makes an unsupported codec fail at open rather than at the first
 affected read.
@@ -244,7 +247,8 @@ content.
 
 ## Block index
 
-`block_count` entries of 20 bytes each, in ascending order of `stream_offset`.
+`block_count` entries of 20 bytes each, or 28 under `FLAG_VARIABLE_BLOCKS`, in
+ascending order of `stream_offset`.
 
 | Offset | Size | Field |
 |---|---|---|
@@ -253,6 +257,7 @@ content.
 | 12 | 4 | `decoded_length`, bytes after decoding |
 | 16 | 1 | `codec` |
 | 17 | 3 | reserved |
+| 20 | 8 | `digest`, present only under `FLAG_VARIABLE_BLOCKS` |
 
 Block `i` covers logical stream range `[i * block_size, i * block_size +
 decoded_length)`. The format places no useful ceiling on `block_size`: large
@@ -269,6 +274,29 @@ than `decoded_length`, the read SHALL fail and return nothing to the caller.
 
 Each block's stored bytes are followed by an 8-byte `xxh3-64` digest of those
 stored bytes. `stored_length` excludes the digest.
+
+### Variable blocks
+
+Under `FLAG_VARIABLE_BLOCKS` a block may end anywhere, so the rules above that
+follow from a fixed `block_size` do not apply. Block `i` covers stream range
+`[start(i), start(i) + decoded_length)`, where `start(0)` is zero and
+`start(i + 1)` is `start(i) + decoded_length` of block `i`. The block holding a
+stream offset is found by a binary search over those starts. `block_size`
+remains a power of two and bounds every block's `decoded_length`.
+
+A writer uses this to end blocks where the content says to, so that content
+which does not change between two builds encodes to the same blocks and the
+same stored bytes wherever other content moved around it. Where blocks end is
+the writer's choice and not part of the format.
+
+Each entry's `digest` equals the `xxh3-64` that follows the block's stored
+bytes, so a block can be identified from the index alone, without reading the
+data region.
+
+A reader SHALL reject the image unless every block's `decoded_length` is
+greater than zero and the decoded lengths sum to `stream_length`. It SHALL
+fail a read, returning nothing, when a block's `digest` differs from the digest
+following its stored bytes.
 
 ## Extent table
 
@@ -472,8 +500,10 @@ output from identical input.
 15. `codec_mask` contains the `stored` bit and the bit of every codec a block
     uses.
 16. `hot_length` is zero.
+17. The superblock does not set `FLAG_VARIABLE_BLOCKS`.
 
-An image with `FLAG_COMPRESSED_METADATA` clear is valid but non-canonical. The
+An image with `FLAG_COMPRESSED_METADATA` clear, or with `FLAG_VARIABLE_BLOCKS`
+set, is valid but non-canonical. The
 canonical encoding uses walk order for the stream; a writer that reorders it,
 as `mkstipple` does by default or with `--hot-list`, produces a valid but
 non-canonical image. `mkstipple --order walk` without a hot list writes the

@@ -2,11 +2,11 @@
 
 use crate::error::{Error, Result};
 use crate::format::{
-    ALIGNMENT, ATTR_ENTRY_SIZE, BLOCK_ENTRY_SIZE, Codec, DIRENT_SIZE, Dirent, EXTENT_SIZE, Extent,
-    FLAG_COMPRESSED_METADATA, FileType, INODE_HEADER_SIZE, Inode, InodeWidths, KNOWN_CODEC_BITS,
-    KNOWN_FLAG_BITS, MAGIC, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, MIN_VERSION_MINOR, SECTION_COUNT,
-    SUPERBLOCK_SIZE, Section, SectionKind, Superblock, VERSION_MAJOR, XATTR_PAIR_SIZE,
-    supported_codecs,
+    ALIGNMENT, ATTR_ENTRY_SIZE, BLOCK_ENTRY_SIZE, BLOCK_ENTRY_SIZE_VARIABLE, Codec, DIRENT_SIZE,
+    Dirent, EXTENT_SIZE, Extent, FLAG_COMPRESSED_METADATA, FLAG_VARIABLE_BLOCKS, FileType,
+    INODE_HEADER_SIZE, Inode, InodeWidths, KNOWN_CODEC_BITS, KNOWN_FLAG_BITS, MAGIC,
+    MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, MIN_VERSION_MINOR, SECTION_COUNT, SUPERBLOCK_SIZE, Section,
+    SectionKind, Superblock, VERSION_MAJOR, XATTR_PAIR_SIZE, supported_codecs,
 };
 use crate::source::{ByteSource, Region};
 
@@ -150,6 +150,11 @@ pub(crate) fn parse_superblock(
     if flags & FLAG_COMPRESSED_METADATA != 0 && version_minor < 2 {
         return Err(Error::Malformed {
             detail: "compressed metadata is not defined before minor version 2",
+        });
+    }
+    if flags & FLAG_VARIABLE_BLOCKS != 0 && version_minor < 4 {
+        return Err(Error::Malformed {
+            detail: "variable blocks are not defined before minor version 4",
         });
     }
 
@@ -322,12 +327,19 @@ pub struct BlockEntry {
     pub decoded_length: u32,
     /// How the bytes are stored.
     pub codec: Codec,
+    /// `xxh3-64` of the stored bytes, recorded in the index only by images
+    /// with [`FLAG_VARIABLE_BLOCKS`].
+    pub digest: Option<u64>,
 }
 
 /// The block index, parsed on demand rather than materialised.
 pub struct BlockIndex<'a> {
     bytes: SectionData<'a>,
     count: u32,
+    block_size: u64,
+    /// Stream offset of every block, present only for variable blocks.
+    /// Fixed blocks start at multiples of `block_size`.
+    starts: Option<Vec<u64>>,
 }
 
 impl BlockIndex<'_> {
@@ -336,21 +348,54 @@ impl BlockIndex<'_> {
         self.count
     }
 
+    fn entry_size(&self) -> usize {
+        if self.starts.is_some() {
+            BLOCK_ENTRY_SIZE_VARIABLE
+        } else {
+            BLOCK_ENTRY_SIZE
+        }
+    }
+
     /// Entry `i`, or `None` when `i` is out of range.
     pub fn get(&self, i: u32) -> Option<BlockEntry> {
         if i >= self.count {
             return None;
         }
-        let at = i as usize * BLOCK_ENTRY_SIZE;
-        let e = self.bytes.get(at..at + BLOCK_ENTRY_SIZE)?;
-        let mut off = [0u8; 8];
-        off.copy_from_slice(&e[0..8]);
+        let size = self.entry_size();
+        let at = i as usize * size;
+        let e = self.bytes.get(at..at + size)?;
         Some(BlockEntry {
-            image_offset: u64::from_le_bytes(off),
-            stored_length: u32::from_le_bytes([e[8], e[9], e[10], e[11]]),
-            decoded_length: u32::from_le_bytes([e[12], e[13], e[14], e[15]]),
+            image_offset: le_u64(&e[0..8]),
+            stored_length: le_u32(&e[8..12]),
+            decoded_length: le_u32(&e[12..16]),
             codec: Codec::from_id(e[16])?,
+            digest: (size == BLOCK_ENTRY_SIZE_VARIABLE).then(|| le_u64(&e[20..28])),
         })
+    }
+
+    /// Stream offset where block `i` begins, or `None` when `i` is out of
+    /// range.
+    pub fn start(&self, i: u32) -> Option<u64> {
+        if i >= self.count {
+            return None;
+        }
+        match &self.starts {
+            Some(starts) => starts.get(i as usize).copied(),
+            None => Some(i as u64 * self.block_size),
+        }
+    }
+
+    /// The block holding stream byte `offset` and the offset within that
+    /// block, or `None` when no block holds it.
+    pub fn locate(&self, offset: u64) -> Option<(u32, u64)> {
+        let index = match &self.starts {
+            Some(starts) => {
+                u32::try_from(starts.partition_point(|&s| s <= offset).checked_sub(1)?).ok()?
+            }
+            None => u32::try_from(offset / self.block_size).ok()?,
+        };
+        let within = offset - self.start(index)?;
+        (within < self.get(index)?.decoded_length as u64).then_some((index, within))
     }
 }
 
@@ -413,13 +458,51 @@ impl<'a> Image<'a> {
     pub fn block_index(&self) -> Result<BlockIndex<'_>> {
         let bytes = self.section_data(SectionKind::Blocks)?;
         let count = self.superblock.block_count;
-        let needed = count as usize * BLOCK_ENTRY_SIZE;
+        let variable = self.superblock.flags & FLAG_VARIABLE_BLOCKS != 0;
+        let entry_size = if variable {
+            BLOCK_ENTRY_SIZE_VARIABLE
+        } else {
+            BLOCK_ENTRY_SIZE
+        };
+        let needed = (count as usize)
+            .checked_mul(entry_size)
+            .ok_or(Error::Malformed {
+                detail: "block_count overflows the block index",
+            })?;
         if bytes.len() < needed {
             return Err(Error::Malformed {
                 detail: "block index section is shorter than block_count requires",
             });
         }
-        let index = BlockIndex { bytes, count };
+        let mut index = BlockIndex {
+            bytes,
+            count,
+            block_size: self.superblock.block_size as u64,
+            starts: None,
+        };
+        if variable {
+            let mut starts = Vec::with_capacity(count as usize);
+            let mut at = 0u64;
+            for i in 0..count {
+                let at_entry = i as usize * entry_size;
+                let length = le_u32(&index.bytes[at_entry + 12..]);
+                if length == 0 {
+                    return Err(Error::Malformed {
+                        detail: "a variable block decodes to nothing",
+                    });
+                }
+                starts.push(at);
+                at = at.checked_add(length as u64).ok_or(Error::Malformed {
+                    detail: "the blocks' decoded lengths overflow",
+                })?;
+            }
+            if at != self.superblock.stream_length {
+                return Err(Error::Malformed {
+                    detail: "the blocks' decoded lengths do not add up to stream_length",
+                });
+            }
+            index.starts = Some(starts);
+        }
         for i in 0..count {
             let e = index.get(i).ok_or(Error::Malformed {
                 detail: "a block index entry names a codec the format does not define",
@@ -1001,11 +1084,7 @@ impl<'i> Reader<'i> {
             }
             if let Some(all) = self.region.slice(e.image_offset, stored_len + 8) {
                 let (b, tail) = all.split_at(e.stored_length as usize);
-                let mut want = [0u8; 8];
-                want.copy_from_slice(tail);
-                if self.phase(|m| &m.digest_ns, || digest(b)) != u64::from_le_bytes(want) {
-                    return Err(Error::ChecksumMismatch { what: "block" });
-                }
+                self.check_block(&e, b, tail)?;
                 self.note(|m| &m.lent);
                 return Ok(Block::Lent(b));
             }
@@ -1068,7 +1147,22 @@ impl<'i> Reader<'i> {
             return None;
         }
         let (stream_offset, _) = self.locate(&inode, offset).ok()?;
-        u32::try_from(stream_offset / self.superblock.block_size as u64).ok()
+        self.blocks.locate(stream_offset).map(|(index, _)| index)
+    }
+
+    /// Check a block's stored bytes against the digest that follows them,
+    /// and that digest against the block index when the index records one.
+    fn check_block(&self, e: &BlockEntry, stored: &[u8], trailing: &[u8]) -> Result<()> {
+        let want = le_u64(trailing);
+        if e.digest.is_some_and(|d| d != want) {
+            return Err(Error::Malformed {
+                detail: "a block's digest disagrees with its block index entry",
+            });
+        }
+        if self.phase(|m| &m.digest_ns, || digest(stored)) != want {
+            return Err(Error::ChecksumMismatch { what: "block" });
+        }
+        Ok(())
     }
 
     /// Fetch, verify and decode one block's stored bytes.
@@ -1083,12 +1177,9 @@ impl<'i> Reader<'i> {
             |m| &m.source_ns,
             || region.read_at(e.image_offset, &mut raw),
         )?;
-        let mut want = [0u8; 8];
-        want.copy_from_slice(&raw[e.stored_length as usize..]);
+        let (stored, tail) = raw.split_at(e.stored_length as usize);
+        self.check_block(&e, stored, tail)?;
         raw.truncate(e.stored_length as usize);
-        if self.phase(|m| &m.digest_ns, || digest(&raw)) != u64::from_le_bytes(want) {
-            return Err(Error::ChecksumMismatch { what: "block" });
-        }
         let decoded = match e.codec {
             Codec::Stored => raw,
             #[cfg(feature = "zstd")]
@@ -1193,7 +1284,6 @@ impl<'i> Reader<'i> {
             return Ok(0);
         }
         let want = (inode.size - offset).min(buf.len() as u64) as usize;
-        let block_size = self.superblock.block_size as u64;
 
         self.note(|m| &m.reads);
         let streaming = self.note_access(ino, offset, want as u64);
@@ -1207,11 +1297,11 @@ impl<'i> Reader<'i> {
                     detail: "an extent points past the end of the stream",
                 });
             }
-            let block_index =
-                u32::try_from(stream_offset / block_size).map_err(|_| Error::Malformed {
+            let (block_index, within) =
+                self.blocks.locate(stream_offset).ok_or(Error::Malformed {
                     detail: "a stream offset falls outside the block index",
                 })?;
-            let within = (stream_offset % block_size) as usize;
+            let within = within as usize;
             let bytes = self.block(block_index, streaming)?;
             let available = bytes.len().checked_sub(within).ok_or(Error::Malformed {
                 detail: "an extent points past the end of its block",

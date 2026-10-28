@@ -12,6 +12,19 @@ use stipplefs::write::{Builder, Node, Options};
 /// A tree whose names come from a small vocabulary and whose contents repeat,
 /// so candidates genuinely tie. A tree of distinct names proves nothing.
 fn fixture() -> Vec<u8> {
+    build_fixture(Options::default())
+}
+
+/// The same tree with content-defined block ends, whose cut points must be
+/// as reproducible as everything else.
+fn variable_fixture() -> Vec<u8> {
+    build_fixture(Options {
+        variable_blocks: true,
+        ..Options::default()
+    })
+}
+
+fn build_fixture(options: Options) -> Vec<u8> {
     let vocab: [&[u8]; 8] = [
         b"src", b"lib", b"test", b"mod", b"util", b"core", b"data", b"main",
     ];
@@ -24,7 +37,7 @@ fn fixture() -> Vec<u8> {
         })
         .collect();
 
-    let mut b = Builder::new(Options::default()).unwrap();
+    let mut b = Builder::new(options).unwrap();
     for i in 0..8usize {
         for j in 0..8usize {
             for (k, body) in bodies.iter().enumerate() {
@@ -212,12 +225,17 @@ fn x86_shaped_content_selects_a_bcj_codec_deterministically() {
 #[test]
 fn repeated_builds_in_one_process_agree() {
     assert_eq!(digest(&fixture()), digest(&fixture()));
+    assert_eq!(digest(&variable_fixture()), digest(&variable_fixture()));
 }
 
 #[test]
 fn writes_are_byte_identical_across_processes() {
     if std::env::var_os("STIPPLEFS_DETERMINISM_CHILD").is_some() {
-        println!("STIPPLEFS_DIGEST={}", digest(&fixture()));
+        println!(
+            "STIPPLEFS_DIGEST={}/{}",
+            digest(&fixture()),
+            digest(&variable_fixture())
+        );
         return;
     }
 

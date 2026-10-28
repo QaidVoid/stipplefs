@@ -7,7 +7,7 @@
 //! memory the compressor itself allocates for a given block size and level.
 //! Output is byte-identical for identical input.
 
-use crate::chunk::{ChunkerConfig, chunks};
+use crate::chunk::{ChunkerConfig, MAX_CHUNK_AVERAGE, MIN_CHUNK_AVERAGE, chunks};
 use crate::error::{Error, Result};
 use crate::format::{
     ALIGNMENT, ATTR_ENTRY_SIZE, BLOCK_ENTRY_SIZE, BLOCK_ENTRY_SIZE_VARIABLE, Codec, DIRENT_SIZE,
@@ -320,6 +320,11 @@ impl Builder {
         if options.codecs & !KNOWN_CODEC_BITS != 0 {
             return Err(Error::Malformed {
                 detail: "the codec set names a codec the format does not define",
+            });
+        }
+        if !(MIN_CHUNK_AVERAGE..=MAX_CHUNK_AVERAGE).contains(&options.chunk_average) {
+            return Err(Error::Malformed {
+                detail: "chunk_average is outside the range 64 bytes to 256 MiB",
             });
         }
         if !(MIN_LEVEL..=MAX_LEVEL).contains(&options.level) {

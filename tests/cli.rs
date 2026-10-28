@@ -670,3 +670,37 @@ fn a_level_outside_the_range_is_refused_by_name() {
         );
     }
 }
+
+#[test]
+fn a_chunk_size_outside_the_range_is_refused_by_name() {
+    let s = Scratch::new("badchunk");
+    let src = s.path("src");
+    make_tree(&src);
+    let build = |size: &str| {
+        let out = s.path(&format!("chunk{size}.stipple"));
+        let built = Command::new(MK)
+            .arg(&src)
+            .arg(&out)
+            .args(["--chunk-size", size, "--mtime", "zero"])
+            .output()
+            .unwrap();
+        (built, out)
+    };
+    for size in ["0", "63", "268435457"] {
+        let (built, out) = build(size);
+        assert!(
+            !built.status.success(),
+            "chunk size {size} was accepted rather than refused"
+        );
+        let message = String::from_utf8_lossy(&built.stderr);
+        assert!(
+            message.contains("64 bytes to 256 MiB"),
+            "the refusal did not name the accepted range: {message}"
+        );
+        assert!(!out.exists(), "a refused build left an image behind");
+    }
+    for size in ["64", "268435456"] {
+        let (built, _) = build(size);
+        assert!(built.status.success(), "chunk size {size} was refused");
+    }
+}

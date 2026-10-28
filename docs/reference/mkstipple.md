@@ -16,7 +16,7 @@ mkstipple [OPTIONS] <SOURCE> <OUTPUT>
 | Option | Default | Meaning |
 |---|---|---|
 | `--block-size <BYTES>` | `33554432` (32 MiB) | Decoded size of a block, a power of two of at least 4096. Larger blocks compress better and cost more to decode on first access. |
-| `--chunk-size <BYTES>` | `4096` | Target average deduplication chunk size. Small chunks find duplicates that larger ones straddle. |
+| `--chunk-size <BYTES>` | `4096` | Target average deduplication chunk size, from 64 bytes to 256 MiB. Small chunks find duplicates that larger ones straddle. |
 | `--order <ORDER>` | `ext` | How files are ordered in the stream. `ext` groups them by extension and name, which compresses better. `walk` uses sorted tree-walk order, the format's canonical encoding. |
 | `--hot-list <FILE>` | none | A file naming, one path per line relative to the source, files to place first in the stream, in that order. See [Hot lists](/guide/hot-lists). |
 

@@ -15,6 +15,13 @@ pub const MIN_DIVISOR: u32 = 4;
 /// Largest chunk, as a multiple of the target average.
 pub const MAX_MULTIPLIER: u32 = 8;
 
+/// Smallest target average a writer accepts.
+pub const MIN_CHUNK_AVERAGE: u32 = 64;
+
+/// Largest target average a writer accepts, so that the largest chunk,
+/// [`MAX_MULTIPLIER`] times the average, still fits a `u32`.
+pub const MAX_CHUNK_AVERAGE: u32 = 1 << 28;
+
 const fn gear_table() -> [u64; 256] {
     let mut t = [0u64; 256];
     let mut state: u64 = 0x2f39_1a4b_9c7d_5e83;

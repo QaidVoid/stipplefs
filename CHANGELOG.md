@@ -1,9 +1,9 @@
 
-## [0.1.1](https://github.com/QaidVoid/stipplefs/compare/v0.1.0...v0.1.1) - 2026-10-28
+## [0.2.0](https://github.com/QaidVoid/stipplefs/compare/v0.1.0...v0.2.0) - 2026-10-28
 
 ### ⛰️  Features
 
-- *(format)* Add content-defined variable blocks - ([aa8acd9](https://github.com/QaidVoid/stipplefs/commit/aa8acd97ea086de315e548459a45a438715ae5be))
+- *(format)* [**breaking**] Add content-defined variable blocks - ([aa8acd9](https://github.com/QaidVoid/stipplefs/commit/aa8acd97ea086de315e548459a45a438715ae5be))
 - *(write)* Give files of a block or more their own blocks - ([8d21b0e](https://github.com/QaidVoid/stipplefs/commit/8d21b0efc6648bc06d90c32ba0bbdd235c26cf55))
 
 ### 🐛 Bug Fixes
